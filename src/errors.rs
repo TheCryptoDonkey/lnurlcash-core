@@ -14,9 +14,9 @@
 //! SERVICE that will not replay a retried mutation, that refusal is also what
 //! a mutation it ALREADY applied looks like. Read them with
 //! [`Error::new_secrets`] and persist them before believing anything.
-//! - [`Error::Unverifiable`] — a MUTATION landed and the SERVICE returned no
-//!   certificate for a `cp1` output it was owed one for. The note exists; it
-//!   just cannot be verified offline.
+//! - [`Error::Unverifiable`] - a MUTATION landed and the SERVICE returned no
+//!   certificate for an output it was owed one for. The note exists; it just
+//!   cannot be verified offline.
 //!
 //! Treating an ambiguous failure as a definitive one is how wallets lose
 //! money: a rotate that times out after the SERVICE burned the input has
@@ -24,6 +24,10 @@
 //! only copy of it in existence.
 
 use thiserror::Error;
+
+/// The reason LUD-25 fixes for a `p1`/`p2` naming a note already outstanding
+/// or burned.
+pub const OUTPUT_IN_USE: &str = "already in use";
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -55,7 +59,7 @@ pub enum Error {
     /// has not implemented LUD-25's replay rule answers a retried rotate,
     /// split or merge with exactly this refusal, its inputs having been burned
     /// by the first attempt - so the caller is told the mutation never happened
-    /// while a note sits at the hash it disclosed. That is why `new_secrets`
+    /// while a note sits at the output it disclosed. That is why `new_secrets`
     /// exists here: read it before believing the refusal.
     #[error("this note has already been spent (service says: \"{reason}\")")]
     NoteSpent {
@@ -73,11 +77,10 @@ pub enum Error {
     },
 
     /// The SERVICE confirmed a rotate, split or merge with `{"status":"OK"}`
-    /// but returned no `cs1` certificate for a `cp1` output. LUD-25 Part 2
-    /// requires one on every `cp1` output, so this is a non-conforming
-    /// SERVICE - but the mutation LANDED. The note exists, at the key or hash
-    /// the caller disclosed, and whatever stands behind it is the only key to
-    /// that value anywhere.
+    /// but returned no `cs1` certificate for a `cp1` output, which is only
+    /// worth naming by its key if it can be checked offline. The mutation
+    /// LANDED. The note exists, at the key or hash the caller disclosed, and
+    /// whatever stands behind it is the only key to that value anywhere.
     ///
     /// So this is an error about the note's VERIFIABILITY, never about its
     /// existence, and it carries the secrets for the same reason
@@ -85,10 +88,10 @@ pub enum Error {
     /// to make a point about conformance. Empty for a mutation whose output
     /// the caller named, since this crate never saw the secret behind it.
     ///
-    /// Raised for a `cp1` output whatever the policy says, and for a plain
-    /// hash output only when [`crate::protocol::Policy::require_signatures`]
-    /// asks for the raw Part 1 signature over it. The tolerant default admits
-    /// the reference mint's no-signer mode.
+    /// Raised for a `cp1` output whatever the policy says, and for a bearer
+    /// output named by its hash only when
+    /// [`crate::protocol::Policy::require_signatures`] asks for its
+    /// certificate. The tolerant default admits a mint with no signer.
     #[error("{message}")]
     Unverifiable {
         message: String,
@@ -175,6 +178,21 @@ impl Error {
         matches!(self, Error::Ambiguous { .. })
     }
 
+    /// Whether the SERVICE refused a mutation because its `p1` or `p2` names a
+    /// note that is outstanding or was burned: LUD-25's reason `already in
+    /// use`. Definitive, and nothing was burned. The output is somebody's note
+    /// already, typically a mint's auto-mint into the same index of a
+    /// registered branch, so retry at the next index.
+    ///
+    /// Matched as a phrase, as lnurl-wallet does: lnurl-mint says `Output
+    /// already in use.` rather than the spec's exact wording.
+    pub fn is_output_in_use(&self) -> bool {
+        match self {
+            Error::ServiceRejected(reason) => reason.to_ascii_lowercase().contains(OUTPUT_IN_USE),
+            _ => false,
+        }
+    }
+
     /// Whether the SERVICE definitively refused. The operation did not happen.
     pub fn is_definitive(&self) -> bool {
         matches!(
@@ -219,3 +237,19 @@ pub fn classify_note_error(reason: &str) -> Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn already_in_use_is_read_in_either_wording() {
+        for reason in ["already in use", "Output already in use."] {
+            assert!(
+                Error::ServiceRejected(reason.into()).is_output_in_use(),
+                "{reason}"
+            );
+        }
+        assert!(!Error::ServiceRejected("Unknown note.".into()).is_output_in_use());
+    }
+}

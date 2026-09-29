@@ -1,13 +1,23 @@
-//! LUD-25 Part 2: notes keyed by a public key and spent by a Schnorr proof.
+//! LUD-25's bech32m strings, key-path notes, and the seed branch they hang off.
 //!
-//! A Part 2 note is filed under a public key rather than a hash. The holder
-//! keeps `sk`, discloses `pk` as `cp1<pk>`, and spends the note with `ck1`, a
-//! BIP-340 signature by `sk` over a fixed message, paired with `pk`: the
-//! SERVICE verifies the pair and looks the note up by `pk`. It certifies each note with
-//! `cs1`, the same signature it has always made, over `hex(pk)` instead of a
-//! hash. Its human-readable part also carries the signed amount using BOLT-11
-//! amount rules, so a recipient can check issuance offline with nothing but
-//! the `ck1` and the `cs1` (see [`crate::signature`]).
+//! Every note is a taproot output key `Q` (see [`crate::spend`]). A key-path
+//! note's `Q` is the holder's own key, used as is: the holder keeps `sk`,
+//! discloses `cp1<Q>`, and spends the note with `ck1<Q || sig>`, a BIP-340
+//! signature by `sk` over the key-path sighash for one mint's domain. The
+//! SERVICE verifies the pair and finds the note by `Q`. It certifies every
+//! note, key-path or bearer, with `cs1` over `hex(Q)`, whose human-readable
+//! part also carries the signed amount using BOLT-11 amount rules, so a
+//! recipient can check issuance offline (see [`crate::signature`]).
+//!
+//! The five strings:
+//!
+//! ```text
+//! cp1<Q>                 a note, 32 bytes
+//! ck1<Q || sig>          a key-path spend, 96 bytes
+//! cw1<...>               a script-path spend, variable
+//! cs<amount>1<sig>       a mint's certificate, 65 bytes
+//! cx1<P || chain code>   a watch-only branch, 64 bytes
+//! ```
 //!
 //! The names and semantics follow the TypeScript kit, which follows
 //! lnurl-wallet's `src/lib`.
@@ -21,58 +31,76 @@ use sha2::{Digest, Sha256};
 
 use crate::cash::{derive_cash_domain_node, derive_cash_root, CashNode};
 use crate::errors::{Error, Result};
-use crate::secrets::{hash_k1, is_preimage};
+use crate::secrets::is_preimage;
 use crate::signature::lightning_signed_digest;
+use crate::spend::{
+    decode_spend, is_x_only_point, key_path_sighash, output_key_of, spend_domain_of, tagged_hash,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
 // ---- bech32m ----
 //
-// Each type has a fixed payload length, so there is no length limit to pick:
-// `ck1`, `cs1` and `cx1` all run past BIP-173's 90 characters, which the draft
-// deliberately does not adopt, and bech32 0.9 enforces none. BIP-350's own
-// rules do apply, as lnurl-mint applies them: one case throughout (all
-// uppercase is the same string, mixed case is refused), a bech32m checksum
-// rather than a bech32 one, and zero padding bits.
+// `ck1`, `cw1`, `cs1` and `cx1` all run past BIP-173's 90 characters, which
+// the draft deliberately does not adopt, and bech32 0.9 enforces none.
+// BIP-350's own rules do apply, as lnurl-mint applies them: one case
+// throughout (all uppercase is the same string, mixed case is refused), a
+// bech32m checksum rather than a bech32 one, and zero padding bits. Every
+// type but `cw1` has a fixed payload length.
 
-fn encode_fixed(hrp: &str, bytes: &[u8]) -> String {
+// No note URL gets near this; it only stops a hostile string costing work.
+const MAX_BECH32_CHARS: usize = 8192;
+
+fn encode_bytes(hrp: &str, bytes: &[u8]) -> String {
     bech32::encode(hrp, bytes.to_base32(), Variant::Bech32m)
         .expect("a fixed, valid human-readable part")
 }
 
-/// Never panics: anything that is not exactly this type, at exactly this
-/// length, is a `None`.
-fn decode_fixed<const N: usize>(hrp: &str, value: &str) -> Option<[u8; N]> {
-    let (prefix, words, variant) = bech32::decode(value.trim()).ok()?;
+/// Never panics: anything that is not this type is a `None`.
+fn decode_bytes(hrp: &str, value: &str) -> Option<Vec<u8>> {
+    let value = value.trim();
+    if value.len() > MAX_BECH32_CHARS {
+        return None;
+    }
+    let (prefix, words, variant) = bech32::decode(value).ok()?;
     if prefix != hrp || variant != Variant::Bech32m {
         return None;
     }
     // non-zero padding bits, or a whole spare group of them, fail here
-    Vec::<u8>::from_base32(&words).ok()?.try_into().ok()
+    Vec::<u8>::from_base32(&words).ok()
 }
 
-/// A note's public key, 32-byte x-only (BIP-340), as a `cp1`. What a WALLET
+fn decode_fixed<const N: usize>(hrp: &str, value: &str) -> Option<[u8; N]> {
+    decode_bytes(hrp, value)?.try_into().ok()
+}
+
+/// A note's output key `Q`, 32-byte x-only, as a `cp1`. What a WALLET
 /// discloses as an output, and what a SERVICE files the note under.
-pub fn encode_cp1(pubkey_x_only: &[u8; 32]) -> String {
-    encode_fixed("cp", pubkey_x_only)
+pub fn encode_cp1(output_key: &[u8; 32]) -> String {
+    encode_bytes("cp", output_key)
 }
 
+/// `None` for anything but a `cp1` whose `Q` is the x coordinate of a curve
+/// point. LUD-25 has a SERVICE refuse any other: no spend could ever open it,
+/// so a note minted to one is value destroyed.
 pub fn decode_cp1(value: &str) -> Option<[u8; 32]> {
-    decode_fixed("cp", value)
+    decode_fixed("cp", value).filter(|key: &[u8; 32]| is_x_only_point(key))
 }
 
 pub fn is_cp1(value: &str) -> bool {
     decode_cp1(value).is_some()
 }
 
-/// A note's bearer secret: its 32-byte x-only public key followed by its
-/// 64-byte BIP-340 signature, as a `ck1`. Whoever has it can spend the note.
+/// A key-path spend: the note's 32-byte output key followed by a 64-byte
+/// BIP-340 signature, as a `ck1`. Whoever has it can spend the note.
 pub fn encode_ck1(payload: &[u8; 96]) -> String {
-    encode_fixed("ck", payload)
+    encode_bytes("ck", payload)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodedCk1 {
+    /// `Q || sig`. Which message `sig` signs is a question for
+    /// [`recover_note_ownership_pubkey`], which needs the mint's domain.
     Current([u8; 96]),
     /// Pre-Schnorr recoverable-ECDSA bearer, accepted only so existing notes
     /// remain spendable long enough to rotate into the current format.
@@ -88,14 +116,101 @@ impl DecodedCk1 {
     }
 }
 
+/// The payload's shape only. LUD-25 has a SERVICE refuse any `ck1` but the
+/// 96-byte one; the 65-byte legacy shape is read here so a wallet can still
+/// rotate a note it holds under one.
 pub fn decode_ck1(value: &str) -> Option<DecodedCk1> {
-    decode_fixed("ck", value)
-        .map(DecodedCk1::Current)
-        .or_else(|| decode_fixed("ck", value).map(DecodedCk1::Legacy))
+    let bytes = decode_bytes("ck", value)?;
+    match bytes.len() {
+        96 => bytes.try_into().ok().map(DecodedCk1::Current),
+        65 => bytes.try_into().ok().map(DecodedCk1::Legacy),
+        _ => None,
+    }
 }
 
 pub fn is_ck1(value: &str) -> bool {
     decode_ck1(value).is_some()
+}
+
+/// A script-path spend: a leaf script, its control block and the witness
+/// items that satisfy it, with the time the spend claims. A bearer note's
+/// full `cw1` is equivalent to its 64-hex preimage (see
+/// [`crate::spend::bearer_cw1`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cw1 {
+    /// The claimed `nLockTime`: 0, or a Unix time at least 500,000,000.
+    pub locktime: u32,
+    /// The claimed `nSequence`. `0xffffffff` claims nothing.
+    pub sequence: u32,
+    pub script: Vec<u8>,
+    /// `(leaf version | parity) || internal key || merkle path`.
+    pub control_block: Vec<u8>,
+    /// Bottom of the stack first; the script and control block excluded.
+    pub witness: Vec<Vec<u8>>,
+}
+
+impl Cw1 {
+    /// The note this spend names, recomputed from its control block. `None`
+    /// if the control block commits to no key.
+    pub fn output_key(&self) -> Option<[u8; 32]> {
+        output_key_of(&self.script, &self.control_block)
+    }
+}
+
+/// `u32 locktime || u32 sequence || (u16 len || item)*` over the script, the
+/// control block, then the witness items bottom of stack first; integers
+/// big-endian. Refused only for an item too long for its 16-bit length.
+pub fn encode_cw1(cw1: &Cw1) -> Result<String> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&cw1.locktime.to_be_bytes());
+    payload.extend_from_slice(&cw1.sequence.to_be_bytes());
+    for item in [&cw1.script, &cw1.control_block]
+        .into_iter()
+        .chain(cw1.witness.iter())
+    {
+        let len = u16::try_from(item.len())
+            .map_err(|_| Error::Protocol("a cw1 item is at most 65535 bytes".into()))?;
+        payload.extend_from_slice(&len.to_be_bytes());
+        payload.extend_from_slice(item);
+    }
+    Ok(encode_bytes("cw", &payload))
+}
+
+/// `None` unless the length prefixes consume the payload exactly, a script
+/// and a control block are both present, and the control block commits to a
+/// key: LUD-25 has a SERVICE refuse anything else, so none of it names a
+/// note.
+pub fn decode_cw1(value: &str) -> Option<Cw1> {
+    let payload = decode_bytes("cw", value)?;
+    if payload.len() < 8 {
+        return None;
+    }
+    let mut items = Vec::new();
+    let mut at = 8;
+    while at < payload.len() {
+        let len = usize::from(u16::from_be_bytes(
+            payload.get(at..at + 2)?.try_into().ok()?,
+        ));
+        at += 2;
+        items.push(payload.get(at..at + len)?.to_vec());
+        at += len;
+    }
+    if items.len() < 2 {
+        return None;
+    }
+    let mut items = items.into_iter();
+    let cw1 = Cw1 {
+        locktime: u32::from_be_bytes(payload[..4].try_into().ok()?),
+        sequence: u32::from_be_bytes(payload[4..8].try_into().ok()?),
+        script: items.next()?,
+        control_block: items.next()?,
+        witness: items.collect(),
+    };
+    cw1.output_key().is_some().then_some(cw1)
+}
+
+pub fn is_cw1(value: &str) -> bool {
+    decode_cw1(value).is_some()
 }
 
 /// A decoded current `cs1`: the amount committed in its human-readable part
@@ -150,7 +265,7 @@ fn decode_amount_suffix(value: &str) -> Option<u64> {
 /// before the amount moved into `cs1`. New code should use
 /// [`encode_cs1_with_amount`].
 pub fn encode_cs1(signature: &[u8; 65]) -> String {
-    encode_fixed("cs", signature)
+    encode_bytes("cs", signature)
 }
 
 pub fn decode_cs1(value: &str) -> Option<[u8; 65]> {
@@ -165,7 +280,7 @@ pub fn is_cs1(value: &str) -> bool {
 /// the signed amount using BOLT-11's amount suffix rules; the payload is the
 /// mint's 65-byte recoverable signature over that amount and the note key.
 pub fn encode_cs1_with_amount(amount_msat: u64, signature: &[u8; 65]) -> String {
-    encode_fixed(
+    encode_bytes(
         &format!("cs{}", encode_amount_suffix(amount_msat)),
         signature,
     )
@@ -211,7 +326,7 @@ pub fn encode_cx1(pubkey_x_only: &[u8; 32], chain_code: &[u8; 32]) -> String {
     let mut bytes = [0u8; 64];
     bytes[..32].copy_from_slice(pubkey_x_only);
     bytes[32..].copy_from_slice(chain_code);
-    encode_fixed("cx", &bytes)
+    encode_bytes("cx", &bytes)
 }
 
 pub fn decode_cx1(value: &str) -> Option<Cx1> {
@@ -232,17 +347,28 @@ pub fn is_cx1(value: &str) -> bool {
 
 // ---- the per-note key tweak ----
 //
-//   t    = tagged_hash("LNURLcash/derive", P || chainCode || ser32_be(i))
+//   t    = tagged_hash("LNURLcash/derive", P || chainCode || ser32(purpose) || ser32(i))
 //   pk_i = x(lift_x(P) + t*G)
 //   sk_i = ((P has even y ? p : n - p) + t) mod n
 //
 // BIP-341's taproot tweak, so a watcher holding only the `cx1` computes the
 // same `pk_i` the holder does, and libsecp256k1 already implements both
-// halves of it. `i` is any u32 and is never hardened. The 4-byte big-endian
-// width is what lnurl-wallet and lnurl-mint both use; the draft text does not
-// pin it.
+// halves of it. `purpose` and `i` are any u32 and never hardened, each a
+// 4-byte big-endian word. `purpose` splits a branch into three independent
+// counters, so a wallet's own indices and a SERVICE's auto-minted ones can
+// never collide by coincidence.
 
-const NOTE_DERIVE_TAG: &[u8] = b"LNURLcash/derive";
+/// Purpose 0: every note the wallet itself mints, rotates into or merges
+/// into, and a split's resulting note `p1`. The registration proof and the
+/// address key are index 0 on this purpose.
+pub const PURPOSE_WALLET: u32 = 0;
+/// Purpose 1: a split's change note `p2`.
+pub const PURPOSE_CHANGE: u32 = 1;
+/// Purpose 2: a note credited by Lightning Address auto-mint or an internal
+/// transfer, whichever rail delivered it.
+pub const PURPOSE_LIGHTNING_ADDRESS: u32 = 2;
+
+const NOTE_DERIVE_TAG: &str = "LNURLcash/derive";
 
 fn unusable(index: u32) -> Error {
     Error::Protocol(format!(
@@ -250,35 +376,48 @@ fn unusable(index: u32) -> Error {
     ))
 }
 
-fn tweak_for(pubkey_x_only: &[u8; 32], chain_code: &[u8; 32], index: u32) -> Result<Scalar> {
-    let tag = Sha256::digest(NOTE_DERIVE_TAG);
-    let t: [u8; 32] = Sha256::new()
-        .chain_update(tag)
-        .chain_update(tag)
-        .chain_update(pubkey_x_only)
-        .chain_update(chain_code)
-        .chain_update(index.to_be_bytes())
-        .finalize()
-        .into();
-    // BIP-341 refuses t >= n rather than reducing it, and so does lnurl-mint.
-    // A ~2^-128 event, but a key reduced here is one no watcher derives, and
-    // a note minted to it is a note nobody can find.
-    Scalar::from_be_bytes(t).map_err(|_| unusable(index))
+fn tweak_for(
+    pubkey_x_only: &[u8; 32],
+    chain_code: &[u8; 32],
+    purpose: u32,
+    index: u32,
+) -> Result<Scalar> {
+    let t = tagged_hash(
+        NOTE_DERIVE_TAG,
+        &[
+            pubkey_x_only,
+            chain_code,
+            &purpose.to_be_bytes(),
+            &index.to_be_bytes(),
+        ],
+    );
+    Scalar::from_be_bytes(reduce_mod_n(t)).map_err(|_| unusable(index))
 }
 
-/// A note's public key at `index`, from the `cx1` half of a branch alone.
+// t mod n, as the spec requires and lnurl-wallet does (lnurl-mint refuses
+// t >= n instead; at ~2^-128 the two never meet). libsecp256k1 only takes a
+// tweak already below n, so k256 reduces it first.
+fn reduce_mod_n(t: [u8; 32]) -> [u8; 32] {
+    use k256::elliptic_curve::ops::Reduce;
+    <k256::Scalar as Reduce<k256::U256>>::reduce_bytes(&t.into())
+        .to_bytes()
+        .into()
+}
+
+/// A note's public key at `purpose` and `index`, from the `cx1` half of a branch alone.
 ///
 /// Watch-only: no private key anywhere, which is what lets a SERVICE holding a
 /// registered `cx1` mint straight to the holder's next key.
 pub fn derive_note_pubkey(
     branch_pubkey_x_only: &[u8; 32],
     chain_code: &[u8; 32],
+    purpose: u32,
     index: u32,
 ) -> Result<[u8; 32]> {
     let secp = Secp256k1::verification_only();
     let branch = XOnlyPublicKey::from_slice(branch_pubkey_x_only)
         .map_err(|_| Error::Protocol("a branch key is not an x-only secp256k1 point".into()))?;
-    let tweak = tweak_for(branch_pubkey_x_only, chain_code, index)?;
+    let tweak = tweak_for(branch_pubkey_x_only, chain_code, purpose, index)?;
     // lift_x(P) + t*G, refusing the point at infinity
     let (note, _parity) = branch
         .add_tweak(&secp, &tweak)
@@ -295,6 +434,7 @@ pub fn derive_note_pubkey(
 pub fn derive_note_secret_key(
     branch_private_key: &[u8; 32],
     chain_code: &[u8; 32],
+    purpose: u32,
     index: u32,
 ) -> Result<[u8; 32]> {
     let secp = Secp256k1::new();
@@ -302,132 +442,165 @@ pub fn derive_note_secret_key(
         Error::Protocol("a branch private key is a 32-byte scalar in [1, n)".into())
     })?;
     let (branch_x, _parity) = branch.x_only_public_key();
-    let tweak = tweak_for(&branch_x.serialize(), chain_code, index)?;
+    let tweak = tweak_for(&branch_x.serialize(), chain_code, purpose, index)?;
     let note = branch
         .add_xonly_tweak(&secp, &tweak)
         .map_err(|_| unusable(index))?;
     Ok(note.secret_bytes())
 }
 
-// ---- ownership proofs ----
+// ---- key-path spends ----
 //
-//   sig = BIP340.Sign(sk, sha256("LNURLcash"))
-//   ck1 = bech32m("ck", pk || sig)
+//   sig = BIP340.Sign(sk, key_path_sighash(Q, domain), aux_rand = 0^32)
+//   ck1 = bech32m("ck", Q || sig)
 //
-// One fixed digest and fixed all-zero BIP-340 auxiliary input make the
-// bearer value deterministic: re-deriving a key reproduces its one `ck1`
-// byte for byte. The message is hashed to 32 bytes before signing (rather
-// than signed as the raw 9-byte ASCII string) because BIP-340's own
-// reference implementation, and most conforming Schnorr signers
-// (`libsecp256k1`'s `schnorrsig` module included), only accept a 32-byte
-// message - `k256::schnorr`'s `sign_raw` is permissive enough not to need
-// this, but signing the raw string would not interoperate with an
-// off-the-shelf signer (2026-09-16, luds#6de59b2).
+// The sighash is BIP-341's for input 0 of the canonical spend transaction
+// (see [`crate::spend`]), so a mint can hand the spend to an off-the-shelf
+// taproot verifier, and a signature one mint has seen can never be replayed
+// at another. Nothing in it depends on value or time, and the auxiliary input
+// is fixed, so a key has exactly one `ck1` per mint and re-deriving the key
+// on recovery reproduces it byte for byte.
+//
+// Three older schemes are read and never produced, since notes minted under
+// them are still money and reference mints still accept them: Schnorr over
+// sha256("LNURLcash") (2026-09-16, luds#6de59b2), Schnorr over the raw
+// 9-byte "LNURLcash", and before that a 65-byte recoverable ECDSA signature
+// with no key alongside it.
 
-const NOTE_OWNERSHIP_MESSAGE: &[u8] = b"LNURLcash";
-const LEGACY_NOTE_OWNERSHIP_MESSAGE: &str = "LNURLcash";
+const LEGACY_OWNERSHIP_MESSAGE: &str = "LNURLcash";
 
-fn note_ownership_digest() -> [u8; 32] {
-    Sha256::digest(NOTE_OWNERSHIP_MESSAGE).into()
+fn legacy_ownership_digest() -> [u8; 32] {
+    Sha256::digest(LEGACY_OWNERSHIP_MESSAGE.as_bytes()).into()
 }
 
-/// The ownership message, `LNURLcash`. A current proof signs its sha256
-/// digest; a proof made before the 2026-09-16 digest change signed these raw
-/// bytes, and [`recover_note_ownership_pubkey`] still reads one.
-pub fn note_ownership_message() -> &'static [u8] {
-    NOTE_OWNERSHIP_MESSAGE
-}
-
-/// The 96-byte `pk || sig` ownership payload. Encode it with [`encode_ck1`]
-/// for the wire: that string spends the note, so it is as secret as the key.
-pub fn sign_note_ownership(secret_key: &[u8; 32]) -> Result<[u8; 96]> {
+/// The 96-byte `Q || sig` key-path spend of the note `x(sk·G)` at `domain`:
+/// the mint's domain, as a note URL, a mint URL or a bare host (see
+/// [`spend_domain_of`]). Encode it with [`encode_ck1`] for the wire: that
+/// string spends the note, so it is as secret as the key.
+///
+/// `Q` is the key as is, with no BIP-86 tweak. To spend a note whose `Q`
+/// commits to a script tree by its key path, pass the tweaked key from
+/// [`crate::spend::taproot_tweak_secret_key`].
+pub fn sign_note_ownership(secret_key: &[u8; 32], domain: &str) -> Result<[u8; 96]> {
     let key = SigningKey::from_bytes(secret_key)
         .map_err(|_| Error::Protocol("a note secret key is a 32-byte scalar in [1, n)".into()))?;
+    let domain = spend_domain_of(domain).ok_or_else(|| {
+        Error::Protocol("a ck1 is signed for a mint's domain, and that names none".into())
+    })?;
+    let output_key: [u8; 32] = key.verifying_key().to_bytes().into();
     let signature = key
-        .sign_raw(&note_ownership_digest(), &[0u8; 32])
-        .map_err(|_| Error::Protocol("could not sign the note ownership message".into()))?;
+        .sign_raw(&key_path_sighash(&output_key, &domain), &[0u8; 32])
+        .map_err(|_| Error::Protocol("could not sign the key-path spend".into()))?;
     let mut out = [0u8; 96];
-    out[..32].copy_from_slice(&key.verifying_key().to_bytes());
+    out[..32].copy_from_slice(&output_key);
     out[32..].copy_from_slice(signature.to_bytes().as_ref());
     Ok(out)
 }
 
-/// Validate a `pk || sig` ownership payload and return its embedded x-only
-/// public key. `None` for an invalid proof or wrong length.
-///
-/// Tries the current sha256-digest scheme first, then falls back to the pre-
-/// 2026-09-16 raw-message scheme so a note minted under it stays redeemable
-/// until it is rotated - never signed under that scheme by [`sign_note_ownership`]
-/// anymore, only read back here.
-pub fn recover_note_ownership_pubkey(payload: &[u8]) -> Option<[u8; 32]> {
-    if payload.len() == 96 {
-        let key = VerifyingKey::from_bytes(&payload[..32]).ok()?;
-        let signature = SchnorrSignature::try_from(&payload[32..]).ok()?;
-        if key.verify_raw(&note_ownership_digest(), &signature).is_ok()
-            || key.verify_raw(NOTE_OWNERSHIP_MESSAGE, &signature).is_ok()
-        {
-            return payload[..32].try_into().ok();
-        }
-        return None;
-    }
-    if payload.len() != 65 {
-        return None;
-    }
-    let recovery = RecoveryId::from_i32(i32::from(payload[64])).ok()?;
-    let signature = RecoverableSignature::from_compact(&payload[..64], recovery).ok()?;
+/// A verified `ck1` payload's note, and whether it was signed under a
+/// deprecated scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoteOwner {
+    pub pubkey_x_only: [u8; 32],
+    /// Signed over a fixed message rather than the key-path sighash, or the
+    /// 65-byte recoverable shape. Still spendable at mints that accept it;
+    /// a holder should rotate it into a current `ck1`.
+    pub legacy: bool,
+}
+
+/// The key a pre-Schnorr 65-byte `ck1` recovers to. Recovering is its only
+/// check: any signature recovers to some key.
+pub(crate) fn legacy_ck1_key(signature: &[u8]) -> Option<[u8; 32]> {
+    let signature: &[u8; 65] = signature.try_into().ok()?;
+    let recovery = RecoveryId::from_i32(i32::from(signature[64])).ok()?;
+    let signature = RecoverableSignature::from_compact(&signature[..64], recovery).ok()?;
     let key = Secp256k1::verification_only()
         .recover_ecdsa(
-            &Message::from_digest(lightning_signed_digest(LEGACY_NOTE_OWNERSHIP_MESSAGE)),
+            &Message::from_digest(lightning_signed_digest(LEGACY_OWNERSHIP_MESSAGE)),
             &signature,
         )
         .ok()?;
     Some(key.x_only_public_key().0.serialize())
 }
 
-// ---- a note's k1, either kind ----
-
-/// The verified key embedded in a `ck1`, from a k1 already trimmed and lowercased.
-fn part2_key_of(value: &str) -> Option<[u8; 32]> {
-    recover_note_ownership_pubkey(decode_ck1(value)?.as_bytes())
+/// Verify a `ck1` payload against the mint at `domain` (a note URL, a mint
+/// URL or a bare host) and return its note. `None` for an invalid proof, one
+/// signed for another mint, or the wrong length.
+///
+/// A 96-byte payload is checked against the key-path sighash for `domain`
+/// first, then against the fixed messages older `ck1`s signed, which are
+/// reported as `legacy`. A 65-byte one is the pre-Schnorr shape, recovered
+/// rather than verified, and always legacy.
+pub fn recover_note_ownership_pubkey(payload: &[u8], domain: &str) -> Option<NoteOwner> {
+    if payload.len() == 65 {
+        return legacy_ck1_key(payload).map(|pubkey_x_only| NoteOwner {
+            pubkey_x_only,
+            legacy: true,
+        });
+    }
+    if payload.len() != 96 {
+        return None;
+    }
+    let pubkey_x_only: [u8; 32] = payload[..32].try_into().ok()?;
+    let key = VerifyingKey::from_bytes(&pubkey_x_only).ok()?;
+    let signature = SchnorrSignature::try_from(&payload[32..]).ok()?;
+    let verifies = |message: &[u8]| key.verify_raw(message, &signature).is_ok();
+    if spend_domain_of(domain)
+        .is_some_and(|domain| verifies(&key_path_sighash(&pubkey_x_only, &domain)))
+    {
+        return Some(NoteOwner {
+            pubkey_x_only,
+            legacy: false,
+        });
+    }
+    (verifies(&legacy_ownership_digest()) || verifies(LEGACY_OWNERSHIP_MESSAGE.as_bytes()))
+        .then_some(NoteOwner {
+            pubkey_x_only,
+            legacy: true,
+        })
 }
 
-/// The id a SERVICE files a note under: sha256(k1) as hex for a Part 1 secret,
-/// the verified public key as hex for a Part 2 `ck1`, and `None` for anything
-/// else, an invalid `ck1` included.
+// ---- a note's k1, any kind ----
+
+/// The id a SERVICE files a note under: `hex(Q)`, for every kind of spend. A
+/// 64-hex preimage names its bearer note's `Q`, a `ck1` carries `Q`, a `cw1`'s
+/// control block commits to it, and a legacy 65-byte `ck1` recovers to it.
+/// `None` for anything that is no spend.
 ///
-/// Compare notes by this, never by an unverified payload.
+/// This names the note; it does not say the spend opens it. A `ck1` states
+/// its `Q` in plain sight, so anyone can write one for any note: whether it
+/// opens the note needs the mint's domain (see [`crate::spend::check_spend`]).
+/// Compare notes by this, never by the spend's string: one note has many
+/// valid spends.
 ///
-/// The k1 is lowercased first, the way [`crate::note::note_k1`] normalises
-/// every k1, so casing never makes one note into two.
+/// Before LUD-25 keyed every note by `Q`, a bearer note's id was its hash
+/// `sha256(k1)`. That is now only its `cp1` short form, from
+/// [`crate::secrets::hash_k1`].
 pub fn note_id_of(k1: &str) -> Option<String> {
-    let value = k1.trim().to_ascii_lowercase();
-    if is_preimage(&value) {
-        return hash_k1(&value).ok();
-    }
-    part2_key_of(&value).map(hex::encode)
+    decode_spend(k1).map(|spend| hex::encode(spend.output_key()))
 }
 
-/// What to look a note up by without disclosing it: the hash for a Part 1
-/// secret, and the `cp1` for a Part 2 note. Pass it to
-/// [`crate::note::build_note_info_url_by_hash`], which sends a hash as `h` and
-/// a `cp1` as `p`.
+/// What to look a note up by without disclosing it, for `?p=`: a bearer
+/// note's hash `h` for a 64-hex preimage, since every mint that ever took a
+/// hash lookup understands it, and `cp1<Q>` for any other spend. Pass it to
+/// [`crate::note::build_note_info_url_by_hash`].
 pub fn note_lookup_of(k1: &str) -> Option<String> {
-    let value = k1.trim().to_ascii_lowercase();
-    if is_preimage(&value) {
-        return hash_k1(&value).ok();
+    let value = k1.trim();
+    if is_preimage(value) {
+        return crate::secrets::hash_k1(&value.to_ascii_lowercase()).ok();
     }
-    part2_key_of(&value).map(|key| encode_cp1(&key))
+    decode_spend(value).map(|spend| encode_cp1(&spend.output_key()))
 }
 
 // ---- the address branch ----
 
 /// `m/139'/d1/d2/d3/d4` for one mint - the literal path this section's text
 /// specifies, and the exact node [`derive_cash_domain_node`] already derives
-/// for any `SERVICE`. There is no separate purpose for Part 2: an earlier
-/// reference-wallet extension deterministically derived Part 1 secrets off
-/// this same root too, under a `1'` sub-purpose kept just for this branch to
-/// avoid colliding with it; that extension is gone (see [`crate::cash`]), so
-/// there is nothing left to collide with.
+/// for any `SERVICE`. There is no separate purpose for key-path notes: an
+/// earlier reference-wallet extension deterministically derived bearer
+/// secrets off this same root too, under a `1'` sub-purpose kept just for
+/// this branch to avoid colliding with it; that extension is gone (see
+/// [`crate::cash`]), so there is nothing left to collide with.
 ///
 /// Bearer material for every note on the branch. Hand out
 /// [`cash_node_to_cx1`] of it, never the node.
@@ -485,20 +658,28 @@ pub fn derive_nostr_address_node(secret_key: &[u8; 32], host: &str) -> Result<Ca
 mod tests {
     use super::*;
     use crate::cash::cash_node_to_hex;
+    use crate::spend::bearer_cw1;
 
     const SEED: [u8; 32] = [0x42; 32];
+    const DOMAIN: &str = "mint.example";
 
     fn words_of(value: &str) -> (String, Vec<bech32::u5>) {
         let (hrp, words, _) = bech32::decode(value).expect("a valid string");
         (hrp, words)
     }
 
-    fn samples() -> [(&'static str, String); 4] {
-        let ownership = sign_note_ownership(&[0x11; 32]).expect("a valid key");
-        let pubkey = recover_note_ownership_pubkey(&ownership).expect("verifies");
+    fn samples() -> [(&'static str, String); 5] {
+        let ownership = sign_note_ownership(&[0x11; 32], DOMAIN).expect("a valid key");
+        let pubkey = recover_note_ownership_pubkey(&ownership, DOMAIN)
+            .expect("verifies")
+            .pubkey_x_only;
         [
             ("cp", encode_cp1(&pubkey)),
             ("ck", encode_ck1(&ownership)),
+            (
+                "cw",
+                encode_cw1(&bearer_cw1(&[0x44; 32]).expect("a cw1")).expect("encodes"),
+            ),
             ("cs", encode_cs1_with_amount(21_000, &[0x33; 65])),
             ("cx", encode_cx1(&pubkey, &[0x22; 32])),
         ]
@@ -508,6 +689,7 @@ mod tests {
         match hrp {
             "cp" => is_cp1(value),
             "ck" => is_ck1(value),
+            "cw" => is_cw1(value),
             "cs" => is_cs1_with_amount(value),
             "cx" => is_cx1(value),
             _ => unreachable!(),
@@ -545,8 +727,9 @@ mod tests {
 
     #[test]
     fn non_zero_padding_is_refused() {
-        // 32, 64 and 96 bytes leave spare bits in the last five-bit group,
-        // which must be zero. 65-byte cs1 fills its groups exactly.
+        // Every payload here leaves spare bits in the last five-bit group,
+        // which must be zero, except 65-byte cs1, which fills its groups
+        // exactly.
         for (hrp, value) in samples() {
             if hrp == "cs" {
                 continue;
@@ -567,28 +750,31 @@ mod tests {
     #[test]
     fn decoders_refuse_hostile_input_without_panicking() {
         let long = format!("cp1{}", "q".repeat(10_000));
+        let long_cw = format!("cw1{}", "q".repeat(10_000));
         for value in [
             "",
             "1",
             "cp1",
             "cp1q",
+            "cw1",
             "ck1\u{e9}\u{e9}\u{e9}",
             "\u{1f4b8}1qqqqqq",
             "cp1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             long.as_str(),
+            long_cw.as_str(),
         ] {
-            for hrp in ["cp", "ck", "cs", "cx"] {
+            for hrp in ["cp", "ck", "cw", "cs", "cx"] {
                 assert!(!decodes(hrp, value), "{hrp}: {value:?}");
             }
             assert_eq!(note_id_of(value), None);
             assert_eq!(note_lookup_of(value), None);
         }
-        assert_eq!(recover_note_ownership_pubkey(&[]), None);
-        assert_eq!(recover_note_ownership_pubkey(&[0xff; 96]), None);
+        assert_eq!(recover_note_ownership_pubkey(&[], DOMAIN), None);
+        assert_eq!(recover_note_ownership_pubkey(&[0xff; 96], DOMAIN), None);
     }
 
     #[test]
-    fn tells_the_four_types_apart() {
+    fn tells_the_five_types_apart() {
         let samples = samples();
         for (hrp, value) in &samples {
             for (other, _) in &samples {
@@ -596,76 +782,156 @@ mod tests {
             }
         }
         let k1 = "11".repeat(32);
-        for hrp in ["cp", "ck", "cs", "cx"] {
+        for hrp in ["cp", "ck", "cw", "cs", "cx"] {
             assert!(!decodes(hrp, &k1), "a plain hex k1 is never a {hrp}1");
         }
     }
 
     #[test]
-    fn a_truncated_or_corrupted_signature_is_not_the_note() {
-        let signature = sign_note_ownership(&[0x11; 32]).expect("a valid key");
-        let pubkey = recover_note_ownership_pubkey(&signature);
-        assert_eq!(recover_note_ownership_pubkey(&signature[..95]), None);
-        let mut corrupted = signature;
-        corrupted[10] ^= 0xff;
-        assert_ne!(recover_note_ownership_pubkey(&corrupted), pubkey);
+    fn a_cp1_off_the_curve_names_no_note() {
+        // x = 5 is not the x coordinate of any point
+        let mut x = [0u8; 32];
+        x[31] = 5;
+        let off_curve = encode_cp1(&x);
+        assert_eq!(decode_cp1(&off_curve), None);
+        assert!(!is_cp1(&off_curve));
     }
 
     #[test]
-    fn one_key_reproduces_one_ck1() {
-        let a = sign_note_ownership(&[0x11; 32]).expect("a valid key");
-        let b = sign_note_ownership(&[0x11; 32]).expect("a valid key");
+    fn a_ck1_opens_its_note_at_its_own_domain_only() {
+        let payload = sign_note_ownership(&[0x11; 32], DOMAIN).expect("a valid key");
+        let owner = recover_note_ownership_pubkey(&payload, DOMAIN).expect("verifies");
+        assert!(!owner.legacy);
+        // the same string at a URL on the same host, in any casing
+        for same in [
+            "https://MINT.example/w?k1=00",
+            "lnurlw://mint.example:443/w",
+        ] {
+            assert_eq!(
+                recover_note_ownership_pubkey(&payload, same),
+                Some(owner),
+                "{same}"
+            );
+        }
+        for other in ["moneyer.dev", "mint.example.com", "", "https://"] {
+            assert_eq!(
+                recover_note_ownership_pubkey(&payload, other),
+                None,
+                "{other:?}"
+            );
+        }
+        assert!(sign_note_ownership(&[0x11; 32], "").is_err());
+    }
+
+    #[test]
+    fn a_truncated_or_corrupted_signature_is_not_the_note() {
+        let signature = sign_note_ownership(&[0x11; 32], DOMAIN).expect("a valid key");
+        let owner = recover_note_ownership_pubkey(&signature, DOMAIN);
+        assert_eq!(
+            recover_note_ownership_pubkey(&signature[..95], DOMAIN),
+            None
+        );
+        let mut corrupted = signature;
+        corrupted[10] ^= 0xff;
+        assert_ne!(recover_note_ownership_pubkey(&corrupted, DOMAIN), owner);
+    }
+
+    #[test]
+    fn one_key_reproduces_one_ck1_per_domain() {
+        let a = sign_note_ownership(&[0x11; 32], DOMAIN).expect("a valid key");
+        let b = sign_note_ownership(&[0x11; 32], DOMAIN).expect("a valid key");
         assert_eq!(a, b);
         assert_eq!(encode_ck1(&a), encode_ck1(&b));
+        let elsewhere = sign_note_ownership(&[0x11; 32], "moneyer.dev").expect("a valid key");
+        assert_eq!(a[..32], elsewhere[..32]);
+        assert_ne!(a[32..], elsewhere[32..]);
     }
 
     #[test]
     fn a_legacy_ck1_stays_readable_for_rotation() {
         let secret = SecretKey::from_slice(&[0x11; 32]).expect("a valid key");
         let signature = Secp256k1::signing_only().sign_ecdsa_recoverable(
-            &Message::from_digest(lightning_signed_digest(LEGACY_NOTE_OWNERSHIP_MESSAGE)),
+            &Message::from_digest(lightning_signed_digest(LEGACY_OWNERSHIP_MESSAGE)),
             &secret,
         );
         let (recovery, compact) = signature.serialize_compact();
         let mut payload = [0u8; 65];
         payload[..64].copy_from_slice(&compact);
         payload[64] = recovery.to_i32() as u8;
-        let ck1 = encode_fixed("ck", &payload);
+        let ck1 = encode_bytes("ck", &payload);
+        let key = secret.x_only_public_key(&Secp256k1::new()).0.serialize();
 
         assert_eq!(decode_ck1(&ck1), Some(DecodedCk1::Legacy(payload)));
         assert!(is_ck1(&ck1));
+        assert_eq!(note_id_of(&ck1), Some(hex::encode(key)));
         assert_eq!(
-            note_id_of(&ck1),
-            Some(hex::encode(
-                secret.x_only_public_key(&Secp256k1::new()).0.serialize()
-            ))
+            recover_note_ownership_pubkey(&payload, DOMAIN),
+            Some(NoteOwner {
+                pubkey_x_only: key,
+                legacy: true
+            })
         );
     }
 
     #[test]
-    fn a_raw_message_ck1_stays_readable_for_rotation() {
-        // Pre-2026-09-16: signed over the raw 9-byte "LNURLcash" string
-        // rather than its sha256 digest - sign_note_ownership never produces
-        // this anymore, but a note minted under it must stay redeemable.
+    fn a_fixed_message_ck1_stays_readable_for_rotation() {
+        // Before every spend moved onto the sighash, a ck1 signed the fixed
+        // message: its sha256 from 2026-09-16, and the raw 9 bytes before
+        // that. sign_note_ownership never produces either, but a note held
+        // under one must stay redeemable, at any domain, since neither names
+        // one.
         let key = SigningKey::from_bytes(&[0x22; 32]).expect("a valid key");
-        let signature = key
-            .sign_raw(NOTE_OWNERSHIP_MESSAGE, &[0u8; 32])
-            .expect("signs");
-        let mut payload = [0u8; 96];
-        payload[..32].copy_from_slice(&key.verifying_key().to_bytes());
-        payload[32..].copy_from_slice(signature.to_bytes().as_ref());
-
         let expected: [u8; 32] = key.verifying_key().to_bytes().into();
-        assert_eq!(recover_note_ownership_pubkey(&payload), Some(expected));
+        for message in [
+            legacy_ownership_digest().to_vec(),
+            LEGACY_OWNERSHIP_MESSAGE.as_bytes().to_vec(),
+        ] {
+            let signature = key.sign_raw(&message, &[0u8; 32]).expect("signs");
+            let mut payload = [0u8; 96];
+            payload[..32].copy_from_slice(&expected);
+            payload[32..].copy_from_slice(signature.to_bytes().as_ref());
+            for domain in [DOMAIN, "moneyer.dev"] {
+                assert_eq!(
+                    recover_note_ownership_pubkey(&payload, domain),
+                    Some(NoteOwner {
+                        pubkey_x_only: expected,
+                        legacy: true
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_cw1_must_consume_its_payload_and_commit_to_a_key() {
+        let cw1 = bearer_cw1(&[0x44; 32]).expect("a cw1");
+        let encoded = encode_cw1(&cw1).expect("encodes");
+        assert_eq!(decode_cw1(&encoded), Some(cw1.clone()));
+
+        let mut no_control = cw1.clone();
+        no_control.control_block = Vec::new();
+        no_control.witness = Vec::new();
+        assert_eq!(decode_cw1(&encode_cw1(&no_control).expect("encodes")), None);
+
+        let mut wrong_parity = cw1.clone();
+        wrong_parity.control_block[0] ^= 1;
+        assert_eq!(
+            decode_cw1(&encode_cw1(&wrong_parity).expect("encodes")),
+            None
+        );
+
+        let mut too_long = cw1;
+        too_long.witness = vec![vec![0; 65_536]];
+        assert!(encode_cw1(&too_long).is_err());
     }
 
     #[test]
     fn signing_refuses_a_key_outside_the_curve_order() {
-        assert!(sign_note_ownership(&[0; 32]).is_err());
-        assert!(sign_note_ownership(&[0xff; 32]).is_err());
-        assert!(derive_note_secret_key(&[0; 32], &[0; 32], 0).is_err());
+        assert!(sign_note_ownership(&[0; 32], DOMAIN).is_err());
+        assert!(sign_note_ownership(&[0xff; 32], DOMAIN).is_err());
+        assert!(derive_note_secret_key(&[0; 32], &[0; 32], 0, 0).is_err());
         // above the field prime, so not an x coordinate at all
-        assert!(derive_note_pubkey(&[0xff; 32], &[0; 32], 0).is_err());
+        assert!(derive_note_pubkey(&[0xff; 32], &[0; 32], 0, 0).is_err());
     }
 
     #[test]
@@ -683,12 +949,14 @@ mod tests {
         let cx1 = cash_node_to_cx1(&node).expect("cx1");
         for index in [0, 1, 0x7fff_ffff, 0x8000_0000, u32::MAX] {
             let pubkey =
-                derive_note_pubkey(&cx1.pubkey_x_only, &cx1.chain_code, index).expect("pubkey");
+                derive_note_pubkey(&cx1.pubkey_x_only, &cx1.chain_code, PURPOSE_WALLET, index)
+                    .expect("pubkey");
             let secret =
-                derive_note_secret_key(&node.private_key, &node.chain_code, index).expect("sk");
-            let signature = sign_note_ownership(&secret).expect("signs");
+                derive_note_secret_key(&node.private_key, &node.chain_code, PURPOSE_WALLET, index)
+                    .expect("sk");
+            let signature = sign_note_ownership(&secret, DOMAIN).expect("signs");
             assert_eq!(
-                recover_note_ownership_pubkey(&signature),
+                recover_note_ownership_pubkey(&signature, DOMAIN).map(|owner| owner.pubkey_x_only),
                 Some(pubkey),
                 "{index}"
             );
@@ -704,5 +972,30 @@ mod tests {
                 .expect("address node");
         let node = derive_nostr_address_node(&identity, "moneyer.dev").expect("nostr node");
         assert_eq!(cash_node_to_hex(&node), cash_node_to_hex(&expected));
+    }
+
+    #[test]
+    fn a_tweak_at_or_above_n_is_reduced_mod_n() {
+        const N: [u8; 32] = [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c,
+            0xd0, 0x36, 0x41, 0x41,
+        ];
+        let mut above = N;
+        above[31] += 5;
+        let mut five = [0u8; 32];
+        five[31] = 5;
+        assert_eq!(reduce_mod_n(N), [0u8; 32]);
+        assert_eq!(reduce_mod_n(above), five);
+        assert_eq!(reduce_mod_n(five), five);
+        // 2^256 - 1 - n, what the all-ones hash reduces to
+        let mut top = [0u8; 32];
+        let mut borrow = 0u16;
+        for i in (0..32).rev() {
+            let d = 0xffu16.wrapping_sub(u16::from(N[i])).wrapping_sub(borrow);
+            top[i] = d as u8;
+            borrow = u16::from(d > 0xff);
+        }
+        assert_eq!(reduce_mod_n([0xff; 32]), top);
     }
 }

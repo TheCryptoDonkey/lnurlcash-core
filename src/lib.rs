@@ -5,26 +5,27 @@
 //! asset:
 //!
 //! ```text
-//! lnurlw://mint.example/w?k1=<secret>&amount=<msat>
+//! lnurlw://mint.example/w?k1=<spend>&c=<cs1>
 //! ```
 //!
-//! Whoever knows the `k1` controls the sats behind it, like a banknote. The
+//! Whoever holds the spend controls the sats behind it, like a banknote. Any
 //! `amount` alongside it is only a claim by whoever encoded the note; the
 //! authoritative value is always `maxWithdrawable` from an informational GET.
 //!
+//! Every note is a BIP-341 taproot output key `Q`, named `cp1<Q>`, and a
+//! spend opens it: a 64-hex preimage (the plain bearer note), a `ck1` (its
+//! key path) or a `cw1` (a leaf of its script tree). See [`spend`].
+//!
 //! Every mutating operation is a GET on the `callback` from that
-//! withdrawRequest:
+//! withdrawRequest, naming each resulting note by its `cp1` or, for a bearer
+//! note, its hash `h`:
 //!
 //! ```text
-//! callback?k1=X&pr=<bolt11>              melt
-//! callback?k1=X&h=<sha256(X')>           rotate
-//! callback?k1=X&amount=<msat>&h=..&h2=.. split
-//! callback?k1=X&k1=Y&h=<sha256(Z)>       merge
+//! callback?k1=X&pr=<bolt11>                  melt
+//! callback?k1=X&p1=<h or cp1>                rotate
+//! callback?k1=X&amount=<msat>&p1=..&p2=..    split
+//! callback?k1=X&k1=Y&p1=<h or cp1>           merge
 //! ```
-//!
-//! A LUD-25 Part 2 note is keyed by a public key instead: its k1 is a `ck1`
-//! containing that key and its Schnorr proof, and its output a `cp1` key sent as `p1`/`p2`. See
-//! [`recoverable`].
 //!
 //! # What this crate is for
 //!
@@ -65,6 +66,7 @@ pub mod protocol;
 pub mod recoverable;
 pub mod secrets;
 pub mod signature;
+pub mod spend;
 pub mod urls;
 
 pub use bolt11::{decode_bolt11_amount_msat, is_bolt11_invoice, same_invoice};
@@ -74,8 +76,8 @@ pub use fees::{
     MintFee,
 };
 pub use note::{
-    build_note_url, is_valid_note_input, note_declared_amount, note_k1, note_signature,
-    resolve_note_input, with_new_k1, without_k1,
+    build_note_url, check_note_url, is_valid_note_input, note_declared_amount, note_k1,
+    note_signature, resolve_note_input, with_new_k1, without_k1,
 };
 pub use protocol::{
     InvoiceResult, MintAddressInfo, MutationResponse, PayRequestInfo, Request, VerifyResult,
@@ -84,9 +86,13 @@ pub use protocol::{
 pub use recoverable::{note_id_of, note_lookup_of};
 pub use secrets::{generate_note_secret, hash_k1, is_preimage};
 pub use signature::{
-    address_proof_digest, address_proof_message, note_signature_digest,
-    note_signature_digest_for_hash, note_signature_message, note_signature_message_for_hash,
-    sign_address_proof, verify_note_signature, verify_note_signature_hash,
+    address_proof_digest, address_proof_message, check_note, check_note_certificate,
+    note_signature_digest, note_signature_digest_for_hash, note_signature_message,
+    note_signature_message_for_hash, sign_address_proof, verify_note_signature,
+    verify_note_signature_hash, CertifiedOver, NoteCheck,
+};
+pub use spend::{
+    check_spend, decode_note, decode_spend, spend_domain_of, SpendCheck, SpendVerdict,
 };
 pub use urls::{
     from_bech32_lnurl, from_lud17, is_allowed_service_url, is_bech32_lnurl, is_lightning_address,

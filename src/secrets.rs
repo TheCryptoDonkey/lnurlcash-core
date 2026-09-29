@@ -8,15 +8,22 @@ use crate::errors::{Error, Result};
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// A note's id: the `h`/`h2` a WALLET discloses on a rotate, split or merge,
-/// and the key a SERVICE stores the note under. Never the secret itself.
+/// A bearer note's hash `h = sha256(preimage)`: its `cp1` short form, what a
+/// WALLET discloses as `p1`/`p2` on a rotate, split or merge or as a mint
+/// comment. Never the preimage itself.
+///
+/// Not the note's id: a SERVICE stores, burns and certifies the note under
+/// its taproot output key `Q`, which follows from `h` (see
+/// [`crate::recoverable::note_id_of`] and [`crate::spend::bearer_note`]).
+/// Before LUD-25 keyed every note by `Q`, this was the id.
 pub fn hash_k1(k1: &str) -> Result<String> {
     let bytes = hex::decode(k1).map_err(|_| Error::Protocol("k1 is not hex".into()))?;
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 /// LUD-25: for a rotate, split or merge, the WALLET - never the SERVICE -
-/// generates the replacement note's secret and discloses only its hash.
+/// generates the replacement note and discloses only what names it. For a
+/// bearer note that is a fresh preimage, disclosed as its hash.
 ///
 /// A fresh 32 bytes, the same size a Lightning payment preimage is, though
 /// nothing is ever paid for it. Drawn from the OS CSPRNG.
@@ -33,7 +40,8 @@ pub fn generate_note_secret() -> String {
 /// bytes: anything guessable is a note anyone can spend.
 pub type SecretSource = fn() -> String;
 
-/// A payment preimage, and therefore a note secret: 32 bytes hex.
+/// 64 hex characters: where a spend goes, a bearer note's preimage; where a
+/// `cp1` goes, a bearer note's hash.
 pub fn is_preimage(value: &str) -> bool {
     let trimmed = value.trim();
     trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit())

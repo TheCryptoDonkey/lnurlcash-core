@@ -1,5 +1,5 @@
 //! LUD-25's `m/139'` branch derivation: the BIP-32 walk from a wallet's cash
-//! root down to a per-`SERVICE` domain node, exactly as Part 2's "Seed &
+//! root down to a per-`SERVICE` domain node, exactly as its "Seed &
 //! derivation" section specifies it:
 //!
 //! ```text
@@ -22,17 +22,18 @@
 //! different tree from every conforming wallet - and a restore against it
 //! finds nothing, silently, and only once the money is gone.
 //!
-//! Part 1 secrets are NOT derived from this node, or from the seed at all -
-//! Part 1's own text has `WALLET` generate plain randomness. An earlier
-//! reference-wallet extension did derive Part 1 secrets deterministically
-//! from a sibling of this branch, hardened at the note's own index; it has
-//! since been dropped as unspecified, and this module no longer provides it.
+//! Bearer-note preimages are NOT derived from this node, or from the seed at
+//! all - LUD-25 has `WALLET` generate plain randomness, and back them up by
+//! other means. An earlier reference-wallet extension did derive them
+//! deterministically from a sibling of this branch, hardened at the note's
+//! own index; it has since been dropped as unspecified, and this module no
+//! longer provides it.
 //! [`crate::secrets`]' legacy scheme (HMAC-SHA256 under `lnurlcash-note-v1`,
 //! predating LUD-25 entirely) is still derived and still scanned on restore
 //! forever, so nothing already minted under either scheme goes missing.
 //!
-//! Part 2's address branch is this exact domain node, for the same host: see
-//! [`crate::recoverable::derive_cash_address_node`].
+//! The key-path notes' address branch is this exact domain node, for the
+//! same host: see [`crate::recoverable::derive_cash_address_node`].
 
 use hmac::{Hmac, Mac};
 use secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
@@ -189,7 +190,7 @@ pub fn cash_domain_indices(root: &CashNode, host: &str) -> Result<[u32; 4]> {
 /// `m/139'/d1/d2/d3/d4` for one mint: everything above a note's own index.
 ///
 /// Its own step because it is the unit a signer is provisioned with, and the
-/// node Part 2's address branch is (see
+/// node the key-path address branch is (see
 /// [`crate::recoverable::derive_cash_address_node`]). It does not spare a
 /// signer the curve: the per-note tweak beneath it, and the `ck1` signature,
 /// both need secp256k1.

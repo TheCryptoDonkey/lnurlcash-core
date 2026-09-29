@@ -41,9 +41,9 @@ pub struct ClientConfig {
     /// caller takes on by doing so.
     pub secret_source: fn() -> String,
     /// What this client insists a SERVICE does. See [`Policy`]; the default
-    /// requires a `mintPubkey` on every note and accepts a plain note
-    /// unsigned, which is what LUD-25 Part 2 makes it. The notes this client
-    /// generates are all plain ones.
+    /// requires a `mintPubkey` on every note and accepts a bearer note
+    /// uncertified, since LUD-25 makes certifying one a SHOULD. The notes this
+    /// client generates are all bearer notes.
     pub policy: Policy,
     /// How many times to re-send a rotate, split or merge whose outcome the
     /// transport lost.
@@ -178,7 +178,7 @@ impl Client {
     /// earn. So a second attempt turns "we don't know" into an answer.
     ///
     /// The request is cloned rather than rebuilt, because the replay is matched
-    /// on the k1 set, `h`, `h2` and `amount`. Regenerating a secret between
+    /// on the notes the k1s open, `p1`, `p2` and `amount`. Regenerating a secret between
     /// attempts would make the retry a DIFFERENT mutation, and against a
     /// SERVICE that had already applied the first, a second real burn.
     ///
@@ -219,18 +219,16 @@ impl Client {
         protocol::parse_note_info(&body, url, self.config.policy)
     }
 
-    /// The informational GET for a note named by its hash, so nothing
-    /// spendable goes on the wire (LUD-25, "Checking a note without exposing
-    /// it"). What a restore walk uses: it queries a whole gap window of
-    /// indices the wallet has not minted into yet, and asking by secret would
-    /// publish exactly the secrets it is about to mint under.
+    /// The informational GET for a note named by `?p=` rather than its spend,
+    /// so nothing spendable goes on the wire (LUD-25, "Checking a note
+    /// without exposing it"). What a restore walk uses: it queries a whole
+    /// gap window of indices the wallet has not minted into yet.
     ///
-    /// A rejection means nothing on its own. A SERVICE that does not index by
-    /// hash must answer as it would for an unknown `k1`, and so must one
-    /// answering for a note that was burned, so only a positive answer is
-    /// evidence of anything.
+    /// A rejection means nothing on its own: a SERVICE answers a note that
+    /// was burned exactly as one it never issued, so only a positive answer
+    /// is evidence of anything.
     ///
-    /// `h` may be a Part 2 `cp1`, looked up as `p`;
+    /// `h` is a `cp1` or a bearer note's hash;
     /// [`crate::recoverable::note_lookup_of`] gives the right one for any k1.
     pub async fn fetch_note_info_by_hash(
         &self,
@@ -239,7 +237,7 @@ impl Client {
     ) -> Result<protocol::NoteInfoByHash> {
         let url = crate::note::build_note_info_url_by_hash(withdraw_link, h).ok_or_else(|| {
             Error::RequestRefused(
-                "a note lookup needs a URL and 32 bytes of hex or a cp1 key".into(),
+                "a note lookup needs a URL and a cp1 or a bearer note's 64-hex hash".into(),
             )
         })?;
         let body = self.run(protocol::note_info_request(&url)?).await?;
@@ -381,7 +379,7 @@ impl Client {
     /// mean one that MAY have landed. This used to be a blanket `Err(_)`, which
     /// covered both and returned the exposed k1 either way, shaped exactly like
     /// a success. When the request had in fact landed, the SERVICE had burned
-    /// that k1 and minted the rotated note under `h`, whose only copy anywhere
+    /// that k1 and minted the rotated note at `p1`, whose only copy anywhere
     /// was the fresh secret [`Error::with_secrets`] attaches for precisely this
     /// reason. Discarding it handed the caller a dead secret and dropped the
     /// live one: an unrecoverable loss of a bearer note, reported as a settled
@@ -428,7 +426,7 @@ impl Client {
             // Ambiguous and Unverifiable both mean the rotate reached the
             // SERVICE; NoteSpent and NoteUnknown are also exactly what a
             // mutation it ALREADY applied looks like asked a second time. In
-            // every one of those the note behind `h` may exist, and the secret
+            // every one of those the note at `p1` may exist, and the secret
             // riding the error is the only key to it.
             Err(err) => Err(err),
         }

@@ -1,8 +1,9 @@
-//! The LUD-25 Part 2 wire: a `ck1` wherever a k1 goes, a `cp1` wherever an
-//! output goes. Pure request building and response parsing, so no mint is
-//! needed. Most values are made here from fixed keys with the crate's own
-//! functions; the echo check starts from a conformance `ck1`. The bytes
-//! themselves are graded in vectors.rs.
+//! The LUD-25 wire: any spend (a 64-hex preimage, a `ck1`, a `cw1`) wherever
+//! a k1 goes, and a `cp1` or a bearer note's hash wherever an output goes,
+//! always as `p1`/`p2`. Pure request building and response parsing, so no
+//! mint is needed. Most values are made here from fixed keys with the
+//! crate's own functions; the echo check starts from a conformance `ck1`.
+//! The bytes themselves are graded in vectors.rs.
 
 use std::path::PathBuf;
 
@@ -13,9 +14,10 @@ use lnurlcash_core::protocol::{
     split_request_with_hash, MutationKind, Policy,
 };
 use lnurlcash_core::recoverable::{
-    encode_ck1, encode_cp1, encode_cs1_with_amount, recover_note_ownership_pubkey,
-    sign_note_ownership,
+    decode_ck1, encode_ck1, encode_cp1, encode_cs1_with_amount, encode_cw1,
+    recover_note_ownership_pubkey, sign_note_ownership,
 };
+use lnurlcash_core::spend::{bearer_cw1, bearer_note};
 use lnurlcash_core::{
     hash_k1, note_id_of, note_lookup_of, note_signature_message, resolve_note_input, Error,
 };
@@ -24,6 +26,7 @@ use url::Url;
 
 const CB: &str = "https://mint.example/w/cb";
 const PAY_CB: &str = "https://mint.example/p/cb";
+const DOMAIN: &str = "mint.example";
 
 struct Part2Note {
     pubkey: String,
@@ -33,8 +36,10 @@ struct Part2Note {
 }
 
 fn part2_note(fill: u8) -> Part2Note {
-    let signature = sign_note_ownership(&[fill; 32]).expect("a valid key");
-    let pubkey = recover_note_ownership_pubkey(&signature).expect("verifies");
+    let signature = sign_note_ownership(&[fill; 32], DOMAIN).expect("a valid key");
+    let pubkey = recover_note_ownership_pubkey(&signature, DOMAIN)
+        .expect("verifies")
+        .pubkey_x_only;
     Part2Note {
         pubkey: hex::encode(pubkey),
         cp1: encode_cp1(&pubkey),
@@ -62,15 +67,31 @@ fn one(url: &str, key: &str) -> Option<String> {
 
 // ---- note ids ----
 
-#[test]
-fn a_part1_secret_is_filed_and_looked_up_under_its_hash() {
-    let hash = hash_k1(&k1()).expect("hash");
-    assert_eq!(note_id_of(&k1()), Some(hash.clone()));
-    assert_eq!(note_lookup_of(&k1()), Some(hash));
+fn bearer_id(preimage: &str) -> String {
+    let h: [u8; 32] = hex::decode(hash_k1(preimage).expect("hash"))
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+    hex::encode(bearer_note(&h).expect("a bearer note").output_key)
 }
 
 #[test]
-fn a_part2_note_is_filed_under_the_verified_key_in_its_ck1() {
+fn a_bearer_note_is_filed_under_its_q_and_looked_up_by_its_hash() {
+    let hash = hash_k1(&k1()).expect("hash");
+    assert_eq!(note_id_of(&k1()), Some(bearer_id(&k1())));
+    assert_ne!(
+        note_id_of(&k1()),
+        Some(hash.clone()),
+        "not sha256(k1) any more"
+    );
+    assert_eq!(note_lookup_of(&k1()), Some(hash));
+    // its full cw1 is the same spend, and names the same note
+    let cw1 = encode_cw1(&bearer_cw1(&[0x11; 32]).expect("a cw1")).expect("encodes");
+    assert_eq!(note_id_of(&cw1), note_id_of(&k1()));
+}
+
+#[test]
+fn a_key_path_note_is_filed_under_the_key_in_its_ck1() {
     let a = part2_note(0x11);
     assert_eq!(note_id_of(&a.ck1), Some(a.pubkey.clone()));
     assert_eq!(note_id_of(&a.ck1.to_ascii_uppercase()), Some(a.pubkey));
@@ -126,7 +147,7 @@ fn a_note_url_may_carry_a_ck1_but_never_a_cp1() {
 }
 
 #[test]
-fn a_part2_note_is_looked_up_by_p_and_a_hash_by_h() {
+fn every_note_is_looked_up_by_p() {
     let a = part2_note(0x11);
     let by_key = build_note_info_url_by_hash("https://mint.example/w?k1=ab", &a.cp1)
         .expect("a cp1 is a lookup");
@@ -142,10 +163,11 @@ fn a_part2_note_is_looked_up_by_p_and_a_hash_by_h() {
         build_note_info_url_by_hash("https://mint.example/w", &a.cp1)
     );
 
+    // a bearer note's hash is the cp1 short form, and goes as p too
     let hash = hash_k1(&k1()).expect("hash");
     let by_hash = build_note_info_url_by_hash("https://mint.example/w", &hash).expect("a hash");
-    assert_eq!(one(&by_hash, "h"), Some(hash));
-    assert_eq!(one(&by_hash, "p"), None);
+    assert_eq!(one(&by_hash, "p"), Some(hash));
+    assert_eq!(one(&by_hash, "h"), None);
 
     // the value that spends the note is never a lookup
     assert_eq!(
@@ -199,15 +221,51 @@ fn an_echoed_ck1_must_be_the_same_valid_bearer() {
         assert_eq!(note_id_of(&info.k1), note_id_of(&ours), "{echoed}");
     }
 
-    // a different note, the note's id in place of its k1, or nothing that is
-    // a note at all, is still refused
+    // a different note, the note's id in place of its k1, nothing that is a
+    // note at all, or the same Q under a signature that does not open it, is
+    // still refused
     let id_of_ours = note_id_of(&ours).expect("an id");
-    for echoed in [other, k1(), id_of_ours, "zz".into()] {
+    let mut forged = decode_ck1(&ours).expect("a ck1").as_bytes().to_vec();
+    forged[40] ^= 0x01;
+    let forged = encode_ck1(&forged.try_into().expect("96 bytes"));
+    assert_eq!(note_id_of(&forged), note_id_of(&ours), "names the same Q");
+    for echoed in [other, k1(), id_of_ours, "zz".into(), forged] {
         assert!(
             matches!(answer(&echoed), Err(Error::Protocol(_))),
             "{echoed} must be refused"
         );
     }
+}
+
+#[test]
+fn an_echoed_spend_of_the_same_bearer_note_is_the_same_note() {
+    // queried by its preimage, echoed as its full cw1: one note, one spend
+    let cw1 = encode_cw1(&bearer_cw1(&[0x11; 32]).expect("a cw1")).expect("encodes");
+    let url = format!("https://mint.example/w?k1={}", k1());
+    let body = |echoed: &str| {
+        json!({
+            "tag": "withdrawRequest",
+            "callback": CB,
+            "k1": echoed,
+            "maxWithdrawable": 21_000,
+            "mintPubkey": format!("02{}", "aa".repeat(32)),
+            "c": "cs1-as-sent",
+        })
+    };
+    let info = parse_note_info(&body(&cw1), &url, Policy::default()).expect("the same note");
+    assert_eq!(info.k1, cw1);
+    // a certificate on the informational GET comes back as sent
+    assert_eq!(info.signature.as_deref(), Some("cs1-as-sent"));
+    // a witness that does not satisfy the leaf names the note but opens
+    // nothing, so it is not an echo of the spend that was queried
+    let mut wrong = bearer_cw1(&[0x11; 32]).expect("a cw1");
+    wrong.witness = vec![vec![0x12; 32]];
+    let wrong = encode_cw1(&wrong).expect("encodes");
+    assert_eq!(note_id_of(&wrong), note_id_of(&k1()));
+    assert!(matches!(
+        parse_note_info(&body(&wrong), &url, Policy::default()),
+        Err(Error::Protocol(_))
+    ));
 }
 
 // ---- mutations ----
@@ -224,38 +282,66 @@ fn a_ck1_rotates_into_a_cp1_sent_as_p1() {
 }
 
 #[test]
-fn a_hash_output_keeps_h_which_every_mint_understands() {
+fn a_hash_output_goes_as_p1_too() {
     let a = part2_note(0x11);
     let hash = hash_k1(&k1()).expect("hash");
     let url = rotate_request_with_hash(CB, &a.ck1, &hash)
         .expect("builds")
         .url;
-    assert_eq!(one(&url, "h"), Some(hash));
-    assert_eq!(one(&url, "p1"), None);
+    assert_eq!(one(&url, "p1"), Some(hash));
+    assert_eq!(one(&url, "h"), None);
 }
 
 #[test]
-fn a_split_names_a_key_and_a_hash_each_under_its_own_name() {
+fn a_split_names_a_key_and_a_hash_as_p1_and_p2() {
     let (a, b) = (part2_note(0x11), part2_note(0x22));
     let hash = hash_k1(&k1()).expect("hash");
     let url = split_request_with_hash(CB, &[a.ck1], 5_000, &b.cp1, &hash)
         .expect("builds")
         .url;
     assert_eq!(one(&url, "p1"), Some(b.cp1.clone()));
-    assert_eq!(one(&url, "h2"), Some(hash.clone()));
-    assert_eq!((one(&url, "h"), one(&url, "p2")), (None, None));
+    assert_eq!(one(&url, "p2"), Some(hash.clone()));
+    assert_eq!((one(&url, "h"), one(&url, "h2")), (None, None));
 
     // and the other way round
     let url = split_request_with_hash(CB, &[k1()], 5_000, &hash, &b.cp1)
         .expect("builds")
         .url;
-    assert_eq!(one(&url, "h"), Some(hash));
+    assert_eq!(one(&url, "p1"), Some(hash));
     assert_eq!(one(&url, "p2"), Some(b.cp1));
-    assert_eq!((one(&url, "p1"), one(&url, "h2")), (None, None));
+    assert_eq!((one(&url, "h"), one(&url, "h2")), (None, None));
 }
 
 #[test]
-fn a_merge_takes_a_part1_secret_and_a_part2_note_together() {
+fn an_output_that_names_no_note_is_never_sent() {
+    let a = part2_note(0x11);
+    let hash = hash_k1(&k1()).expect("hash");
+    // a spend, a certificate, short hex and an off-curve key: none names a
+    // note that any spend could open, so none is ever an output
+    let mut off_curve = [0u8; 32];
+    off_curve[31] = 5;
+    for bad in [
+        a.ck1.clone(),
+        a.cs1_shaped.clone(),
+        "11".repeat(31),
+        encode_cp1(&off_curve),
+    ] {
+        for result in [
+            rotate_request_with_hash(CB, &k1(), &bad),
+            merge_request_with_hash(CB, &[k1()], &bad),
+            split_request_with_hash(CB, &[k1()], 5_000, &bad, &hash),
+            split_request_with_hash(CB, &[k1()], 5_000, &hash, &bad),
+        ] {
+            assert!(
+                matches!(result, Err(Error::RequestRefused(_))),
+                "{bad}: {result:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_merge_takes_a_bearer_note_and_a_key_path_note_together() {
     let (a, c) = (part2_note(0x11), part2_note(0x33));
     let url = merge_request_with_hash(CB, &[k1(), a.ck1.clone()], &c.cp1)
         .expect("builds")
@@ -266,10 +352,10 @@ fn a_merge_takes_a_part1_secret_and_a_part2_note_together() {
 
 // ---- what a response owes each output ----
 //
-// A cp1 output is owed its amount-bearing cs1, in `sig` or in `sig2` for a
-// split's change, whatever the policy says. A legacy hash uses the raw Part 1
-// signature when available and may be unsigned in no-signer mode. The request
-// records which it named, and the parser reads that back.
+// A cp1 output is owed its amount-bearing cs1, in `c` or in `c2` for a
+// split's change, whatever the policy says. A bearer output named by its hash
+// is certified by a mint with a signer and may be uncertified by one without.
+// The request records which it named, and the parser reads that back.
 
 #[test]
 fn a_request_records_the_outputs_it_named() {
@@ -361,7 +447,7 @@ fn an_uncertified_cp1_output_is_unverifiable_whatever_the_policy() {
     // certified, the same rotate is fine, and the certificate comes back
     let request = rotate_request_with_hash(CB, &a.ck1, &b.cp1).expect("builds");
     let response = parse_mutation(
-        &json!({"status": "OK", "sig": b.cs1_shaped}),
+        &json!({"status": "OK", "c": b.cs1_shaped}),
         MutationKind::Rotate,
         &request.outputs,
         Policy::default(),
@@ -371,16 +457,16 @@ fn an_uncertified_cp1_output_is_unverifiable_whatever_the_policy() {
 }
 
 #[test]
-fn a_cp1_change_is_owed_its_certificate_in_sig2() {
+fn a_cp1_change_is_owed_its_certificate_in_c2() {
     let b = part2_note(0x22);
     let hash = hash_k1(&k1()).expect("hash");
     let request = split_request_with_hash(CB, &[k1()], 5_000, &hash, &b.cp1).expect("builds");
 
-    // the first output is a legacy hash note: it may be unsigned in no-signer
-    // mode or carry a raw Part 1 signature, and neither excuses the change
+    // the first output is a bearer note: it may be uncertified in no-signer
+    // mode or carry its certificate, and neither excuses the change
     for body in [
         json!({"status": "OK"}),
-        json!({"status": "OK", "sig": "ab".repeat(65)}),
+        json!({"status": "OK", "c": "ab".repeat(65)}),
     ] {
         let err = parse_mutation(
             &body,
@@ -394,12 +480,12 @@ fn a_cp1_change_is_owed_its_certificate_in_sig2() {
     }
 
     let response = parse_mutation(
-        &json!({"status": "OK", "sig2": b.cs1_shaped}),
+        &json!({"status": "OK", "c2": b.cs1_shaped}),
         MutationKind::Split,
         &request.outputs,
         Policy::default(),
     )
-    .expect("the change is certified and the plain note owes nothing");
+    .expect("the change is certified and the bearer note owes nothing");
     assert_eq!(response.signature, None);
     assert_eq!(response.change_signature, Some(b.cs1_shaped));
 }
