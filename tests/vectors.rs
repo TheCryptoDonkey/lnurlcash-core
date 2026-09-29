@@ -22,6 +22,7 @@ use lnurlcash_core::recoverable::{
     derive_note_pubkey, derive_note_secret_key, encode_ck1, encode_cp1, encode_cs1_with_amount,
     encode_cw1, encode_cx1, is_ck1, is_cp1, is_cs1_with_amount, is_cw1, is_cx1,
     recover_note_ownership_pubkey, sign_note_ownership, Cw1, DecodedCk1, NOSTR_CASH_SEED_LABEL,
+    PURPOSE_WALLET,
 };
 use lnurlcash_core::secrets::{derive_note_root, derive_note_secret};
 use lnurlcash_core::spend::{
@@ -881,6 +882,10 @@ fn index_of(note: &Value) -> u32 {
     u32::try_from(note["index"].as_u64().expect("index")).expect("a note index is a u32")
 }
 
+fn purpose_of(note: &Value) -> u32 {
+    u32::try_from(note["purpose"].as_u64().expect("purpose")).expect("a purpose is a u32")
+}
+
 /// BIP-39's seed from its mnemonic: PBKDF2-HMAC-SHA512, 2048 rounds, salt
 /// "mnemonic" and no passphrase. Only here so the vectors' `mnemonic` is
 /// graded against their `seedHex`: the crate itself takes raw seed bytes and
@@ -1072,16 +1077,26 @@ fn part2_branch_vectors() {
 
         for note in branch["notes"].as_array().expect("notes") {
             let index = index_of(note);
-            let at = format!("{host} #{index}");
+            let at = format!("{host} p{} #{index}", purpose_of(note));
 
-            let pubkey = derive_note_pubkey(&watched.pubkey_x_only, &watched.chain_code, index)
-                .unwrap_or_else(|err| panic!("{at}: {err}"));
+            let pubkey = derive_note_pubkey(
+                &watched.pubkey_x_only,
+                &watched.chain_code,
+                purpose_of(note),
+                index,
+            )
+            .unwrap_or_else(|err| panic!("{at}: {err}"));
             assert_eq!(hex::encode(pubkey), str_of(note, "notePubkey"), "{at}");
             assert_eq!(encode_cp1(&pubkey), str_of(note, "cp1"), "{at}");
             assert_eq!(decode_cp1(&str_of(note, "cp1")), Some(pubkey), "{at}");
 
-            let secret = derive_note_secret_key(&node.private_key, &node.chain_code, index)
-                .unwrap_or_else(|err| panic!("{at}: {err}"));
+            let secret = derive_note_secret_key(
+                &node.private_key,
+                &node.chain_code,
+                purpose_of(note),
+                index,
+            )
+            .unwrap_or_else(|err| panic!("{at}: {err}"));
             assert_eq!(hex::encode(secret), str_of(note, "noteSecretKey"), "{at}");
 
             grade_key_path_note(note, &secret, &host, &domain, &at);
@@ -1401,12 +1416,18 @@ fn nostr_seed_vectors() {
 
         for note in case["notes"].as_array().expect("notes") {
             let index = index_of(note);
-            let at = format!("{host} #{index}");
-            let secret = derive_note_secret_key(&node.private_key, &node.chain_code, index)
-                .unwrap_or_else(|err| panic!("{at}: {err}"));
+            let at = format!("{host} p{} #{index}", purpose_of(note));
+            let secret = derive_note_secret_key(
+                &node.private_key,
+                &node.chain_code,
+                purpose_of(note),
+                index,
+            )
+            .unwrap_or_else(|err| panic!("{at}: {err}"));
             assert_eq!(hex::encode(secret), str_of(note, "noteSecretKey"), "{at}");
-            let pubkey = derive_note_pubkey(&cx1.pubkey_x_only, &cx1.chain_code, index)
-                .unwrap_or_else(|err| panic!("{at}: {err}"));
+            let pubkey =
+                derive_note_pubkey(&cx1.pubkey_x_only, &cx1.chain_code, purpose_of(note), index)
+                    .unwrap_or_else(|err| panic!("{at}: {err}"));
             assert_eq!(hex::encode(pubkey), str_of(note, "notePubkey"), "{at}");
             assert_eq!(encode_cp1(&pubkey), str_of(note, "cp1"), "{at}");
             grade_key_path_note(note, &secret, &host, &domain, &at);
@@ -1500,15 +1521,21 @@ fn spec_vectors() {
 
         for note in case["notes"].as_array().expect("notes") {
             let index = note["index"].as_u64().expect("index") as u32;
-            let at = format!("{vector_name} #{index}");
+            let at = format!("{vector_name} p{} #{index}", purpose_of(note));
 
-            let pk = derive_note_pubkey(&cx1.pubkey_x_only, &cx1.chain_code, index)
-                .unwrap_or_else(|err| panic!("{at}: {err}"));
+            let pk =
+                derive_note_pubkey(&cx1.pubkey_x_only, &cx1.chain_code, purpose_of(note), index)
+                    .unwrap_or_else(|err| panic!("{at}: {err}"));
             assert_eq!(hex::encode(pk), str_of(note, "pk"), "{at}");
             assert_eq!(encode_cp1(&pk), str_of(note, "cp1"), "{at}");
 
-            let sk = derive_note_secret_key(&branch.private_key, &branch.chain_code, index)
-                .unwrap_or_else(|err| panic!("{at}: {err}"));
+            let sk = derive_note_secret_key(
+                &branch.private_key,
+                &branch.chain_code,
+                purpose_of(note),
+                index,
+            )
+            .unwrap_or_else(|err| panic!("{at}: {err}"));
             assert_eq!(hex::encode(sk), str_of(note, "sk"), "{at}");
 
             // x(sk_i . G) == pk_i, the round-trip 25.md calls out explicitly
@@ -1524,7 +1551,8 @@ fn spec_vectors() {
     // the vector's own domain
     let v2 = &vectors["vector2"];
     let branch2 = branch_of(v2);
-    let sk0 = derive_note_secret_key(&branch2.private_key, &branch2.chain_code, 0).expect("sk_0");
+    let sk0 = derive_note_secret_key(&branch2.private_key, &branch2.chain_code, PURPOSE_WALLET, 0)
+        .expect("sk_0");
     for proof in v2["addressProofs"].as_array().expect("addressProofs") {
         let action = str_of(proof, "action");
         let domain = str_of(proof, "domain");

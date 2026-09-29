@@ -212,7 +212,7 @@ pub struct FfiWithdrawInfo {
     pub min_withdrawable: u64,
     pub default_description: Option<String>,
     pub mint_pubkey: Option<String>,
-    /// `sig`: the service's `cs1` for the queried note, as sent and
+    /// `c`: the service's `cs1` for the queried note, as sent and
     /// unverified. Check it with [`check_note`].
     pub signature: Option<String>,
 }
@@ -226,7 +226,7 @@ pub struct FfiNoteInfoByHash {
     pub min_withdrawable: u64,
     pub default_description: Option<String>,
     pub mint_pubkey: Option<String>,
-    /// `sig`, as sent and unverified. Check it with
+    /// `c`, as sent and unverified. Check it with
     /// [`check_note_certificate`] against what was looked up.
     pub signature: Option<String>,
 }
@@ -448,7 +448,7 @@ pub fn check_note(
     signature::check_note(k1, domain, amount_msat, signature, mint_pubkey_hex).map(Into::into)
 }
 
-/// [`check_note`] from a certified note URL, `...?k1=<spend>&sig=<cs1>`, with
+/// [`check_note`] from a certified note URL, `...?k1=<spend>&c=<cs1>`, with
 /// the domain, spend, certificate and declared amount all read off it.
 #[uniffi::export]
 pub fn check_note_url(url: &str, mint_pubkey_hex: &str) -> Option<FfiNoteCheck> {
@@ -930,18 +930,21 @@ pub fn is_cx1(value: &str) -> bool {
     recoverable::is_cx1(value)
 }
 
-/// A note's public key at `index`, from the watch-only half of a branch.
-/// `index` is any u32 and never hardened. An unusable index is an error:
+/// A note's public key at `purpose` and `index`, from the watch-only half of
+/// a branch. `purpose` is 0 wallet, 1 change, 2 Lightning Address; both it and
+/// `index` are any u32 and never hardened. An unusable index is an error:
 /// use the next one.
 #[uniffi::export]
 pub fn derive_note_pubkey(
     branch_pubkey_x_only_hex: &str,
     chain_code_hex: &str,
+    purpose: u32,
     index: u32,
 ) -> FfiResult<String> {
     Ok(hex::encode(recoverable::derive_note_pubkey(
         &hex_array(branch_pubkey_x_only_hex, "a branch pubkey")?,
         &hex_array(chain_code_hex, "a chain code")?,
+        purpose,
         index,
     )?))
 }
@@ -951,11 +954,13 @@ pub fn derive_note_pubkey(
 pub fn derive_note_secret_key(
     branch_private_key_hex: &str,
     chain_code_hex: &str,
+    purpose: u32,
     index: u32,
 ) -> FfiResult<String> {
     Ok(hex::encode(recoverable::derive_note_secret_key(
         &hex_array(branch_private_key_hex, "a branch private key")?,
         &hex_array(chain_code_hex, "a chain code")?,
+        purpose,
         index,
     )?))
 }

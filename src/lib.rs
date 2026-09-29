@@ -5,7 +5,7 @@
 //! asset:
 //!
 //! ```text
-//! lnurlw://mint.example/w?k1=<spend>&sig=<cs1>
+//! lnurlw://mint.example/w?k1=<spend>&c=<cs1>
 //! ```
 //!
 //! Whoever holds the spend controls the sats behind it, like a banknote. Any

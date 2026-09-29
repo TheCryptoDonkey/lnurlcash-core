@@ -249,7 +249,7 @@ fn an_echoed_spend_of_the_same_bearer_note_is_the_same_note() {
             "k1": echoed,
             "maxWithdrawable": 21_000,
             "mintPubkey": format!("02{}", "aa".repeat(32)),
-            "sig": "cs1-as-sent",
+            "c": "cs1-as-sent",
         })
     };
     let info = parse_note_info(&body(&cw1), &url, Policy::default()).expect("the same note");
@@ -352,7 +352,7 @@ fn a_merge_takes_a_bearer_note_and_a_key_path_note_together() {
 
 // ---- what a response owes each output ----
 //
-// A cp1 output is owed its amount-bearing cs1, in `sig` or in `sig2` for a
+// A cp1 output is owed its amount-bearing cs1, in `c` or in `c2` for a
 // split's change, whatever the policy says. A bearer output named by its hash
 // is certified by a mint with a signer and may be uncertified by one without.
 // The request records which it named, and the parser reads that back.
@@ -447,7 +447,7 @@ fn an_uncertified_cp1_output_is_unverifiable_whatever_the_policy() {
     // certified, the same rotate is fine, and the certificate comes back
     let request = rotate_request_with_hash(CB, &a.ck1, &b.cp1).expect("builds");
     let response = parse_mutation(
-        &json!({"status": "OK", "sig": b.cs1_shaped}),
+        &json!({"status": "OK", "c": b.cs1_shaped}),
         MutationKind::Rotate,
         &request.outputs,
         Policy::default(),
@@ -457,7 +457,7 @@ fn an_uncertified_cp1_output_is_unverifiable_whatever_the_policy() {
 }
 
 #[test]
-fn a_cp1_change_is_owed_its_certificate_in_sig2() {
+fn a_cp1_change_is_owed_its_certificate_in_c2() {
     let b = part2_note(0x22);
     let hash = hash_k1(&k1()).expect("hash");
     let request = split_request_with_hash(CB, &[k1()], 5_000, &hash, &b.cp1).expect("builds");
@@ -466,7 +466,7 @@ fn a_cp1_change_is_owed_its_certificate_in_sig2() {
     // mode or carry its certificate, and neither excuses the change
     for body in [
         json!({"status": "OK"}),
-        json!({"status": "OK", "sig": "ab".repeat(65)}),
+        json!({"status": "OK", "c": "ab".repeat(65)}),
     ] {
         let err = parse_mutation(
             &body,
@@ -480,7 +480,7 @@ fn a_cp1_change_is_owed_its_certificate_in_sig2() {
     }
 
     let response = parse_mutation(
-        &json!({"status": "OK", "sig2": b.cs1_shaped}),
+        &json!({"status": "OK", "c2": b.cs1_shaped}),
         MutationKind::Split,
         &request.outputs,
         Policy::default(),

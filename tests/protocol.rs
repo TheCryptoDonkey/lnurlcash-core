@@ -117,7 +117,7 @@ impl MockMint {
             .hook(&format!("/_test/credit?k1={k1}&amount={amount_msat}"))
             .await;
         assert_eq!(body["status"], "OK", "credit failed: {body}");
-        body["sig"].as_str().map(str::to_string)
+        body["c"].as_str().map(str::to_string)
     }
 
     /// Bring a note into existence at an output: a `cp1`, or a bearer note's
@@ -127,7 +127,7 @@ impl MockMint {
             .hook(&format!("/_test/credit?p={output}&amount={amount_msat}"))
             .await;
         assert_eq!(body["status"], "OK", "credit failed: {body}");
-        body["sig"].as_str().map(str::to_string)
+        body["c"].as_str().map(str::to_string)
     }
 
     /// What the SERVICE thinks of a note - the difference between what a mint

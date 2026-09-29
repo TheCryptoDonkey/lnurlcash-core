@@ -32,11 +32,15 @@ pub fn note_declared_amount(url: &str) -> Option<u64> {
     if let Some(amount) = first_param(url, "amount") {
         return amount.parse().ok();
     }
-    decode_cs1_with_amount(&first_param(url, "sig")?).map(|cs1| cs1.amount_msat)
+    decode_cs1_with_amount(&note_signature(url)?).map(|cs1| cs1.amount_msat)
 }
 
+/// The certificate a note URL carries: `&c=<cs1>`. Read only: the legacy
+/// `&sig=` name that LUD-25 used before 50d740a is still accepted here, so
+/// notes already in circulation keep verifying; everything this crate writes
+/// says `c`.
 pub fn note_signature(url: &str) -> Option<String> {
-    first_param(url, "sig")
+    first_param(url, "c").or_else(|| first_param(url, "sig"))
 }
 
 /// Input only qualifies as a note if it resolves to a URL carrying a spend
@@ -101,7 +105,7 @@ pub fn build_note_url(withdraw_link: &str, k1: &str, amount_msat: Option<u64>) -
 /// [`crate::recoverable::note_lookup_of`] gives the right one for any spend.
 /// A `cp1` whose key is not a point, or anything else, is `None`.
 ///
-/// `k1`, `amount` and `sig` are dropped: naming the note twice, once in a form
+/// `k1`, `amount` and the certificate (`c`, or legacy `sig`) are dropped: naming the note twice, once in a form
 /// that spends it, would defeat the point.
 ///
 /// A burned note is answered exactly as one that never existed, so a
@@ -112,7 +116,9 @@ pub fn build_note_info_url_by_hash(withdraw_link: &str, h: &str) -> Option<Strin
     let url = Url::parse(&from_lud17(withdraw_link.trim())).ok()?;
     let mut pairs: Vec<(String, String)> = url
         .query_pairs()
-        .filter(|(k, _)| k != "k1" && k != "amount" && k != "sig" && k != "p" && k != "h")
+        .filter(|(k, _)| {
+            k != "k1" && k != "amount" && k != "c" && k != "sig" && k != "p" && k != "h"
+        })
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .collect();
     pairs.push(("p".into(), value));
@@ -120,7 +126,7 @@ pub fn build_note_info_url_by_hash(withdraw_link: &str, h: &str) -> Option<Strin
 }
 
 /// LUD-25's offline verification of a certified note URL,
-/// `lnurlw://mint.example/w?k1=<spend>&sig=<cs1>`, against the `mintPubkey`
+/// `lnurlw://mint.example/w?k1=<spend>&c=<cs1>`, against the `mintPubkey`
 /// on record for that SERVICE: the spend must open its note at the URL's own
 /// domain, and the certificate must cover that note and the amount the note
 /// declares (its `amount`, or the amount a current `cs1` carries).
@@ -166,10 +172,13 @@ pub fn with_new_k1(
                     saw_amount = true;
                 }
             }
-            "sig" => {
+            // A legacy `sig` is replaced by `c`, never carried alongside it.
+            "c" | "sig" => {
                 if let Some(sig) = signature {
-                    pairs.push(("sig".to_string(), sig.to_string()));
-                    saw_sig = true;
+                    if !saw_sig {
+                        pairs.push(("c".to_string(), sig.to_string()));
+                        saw_sig = true;
+                    }
                 }
             }
             _ => pairs.push((key.into_owned(), value.into_owned())),
@@ -183,7 +192,7 @@ pub fn with_new_k1(
     }
     if let Some(sig) = signature {
         if !saw_sig {
-            pairs.push(("sig".to_string(), sig.to_string()));
+            pairs.push(("c".to_string(), sig.to_string()));
         }
     }
     Some(rebuild(&parsed, pairs))
@@ -206,10 +215,13 @@ pub fn without_k1(url: &str, amount_msat: u64, signature: Option<&str>) -> Optio
                     saw_amount = true;
                 }
             }
-            "sig" => {
+            // A legacy `sig` is replaced by `c`, never carried alongside it.
+            "c" | "sig" => {
                 if let Some(sig) = signature {
-                    pairs.push(("sig".to_string(), sig.to_string()));
-                    saw_sig = true;
+                    if !saw_sig {
+                        pairs.push(("c".to_string(), sig.to_string()));
+                        saw_sig = true;
+                    }
                 }
             }
             _ => pairs.push((key.into_owned(), value.into_owned())),
@@ -220,8 +232,36 @@ pub fn without_k1(url: &str, amount_msat: u64, signature: Option<&str>) -> Optio
     }
     if let Some(sig) = signature {
         if !saw_sig {
-            pairs.push(("sig".to_string(), sig.to_string()));
+            pairs.push(("c".to_string(), sig.to_string()));
         }
     }
     Some(rebuild(&parsed, pairs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const K1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    #[test]
+    fn a_certificate_is_read_as_c_or_legacy_sig_and_written_as_c() {
+        let current = format!("lnurlw://mint.example/w?k1={K1}&c=cs1abc");
+        let legacy = format!("lnurlw://mint.example/w?k1={K1}&sig=cs1abc");
+        assert_eq!(note_signature(&current).as_deref(), Some("cs1abc"));
+        assert_eq!(note_signature(&legacy).as_deref(), Some("cs1abc"));
+
+        let rewritten = with_new_k1(&legacy, K1, 21_000, Some("cs1new")).expect("rebuilds");
+        assert_eq!(note_signature(&rewritten).as_deref(), Some("cs1new"));
+        assert!(rewritten.contains("c=cs1new"), "{rewritten}");
+        assert!(!rewritten.contains("sig="), "{rewritten}");
+
+        let by_hash = build_note_info_url_by_hash(
+            &format!("lnurlw://mint.example/w?c=cs1abc&sig=cs1abc&k1={K1}"),
+            &"ab".repeat(32),
+        );
+        if let Some(url) = by_hash {
+            assert!(!url.contains("c=cs1") && !url.contains("sig="), "{url}");
+        }
+    }
 }

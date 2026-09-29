@@ -25,7 +25,7 @@ protocol::melt_request(callback, k1, bolt11) -> Request
 protocol::parse_mutation(&Value, MutationKind, &request.outputs, Policy)
   -> MutationResponse. outputs = what the rotate/split/merge named, recorded
   on the Request: [output], or [output, change] for a split. A cp1 output is
-  owed its cs1 in sig (sig2 for a split's change) ALWAYS, whatever the
+  owed its cs1 in c (c2 for a split's change; legacy sig/sig2 still read) ALWAYS, whatever the
   policy; without it the mutation is Unverifiable. A bearer output named by
   its hash is certified by a mint with a signer; the tolerant default admits
   None from one without. A missing output reads as a hash. Signatures come
@@ -35,7 +35,7 @@ protocol::Policy { require_signatures, require_mint_pubkey }  defaults false
   and true. require_signatures demands a cs1 for a bearer output too.
   require_mint_pubkey refuses a withdrawRequest with no valid mintPubkey.
   Build with ..Policy::default().
-protocol::parse_note_info also returns `signature`: the sig LUD-25 has the
+protocol::parse_note_info also returns `signature`: the c LUD-25 has the
   informational GET return for the queried note, as sent. Same on
   NoteInfoByHash.
 protocol::pay_request_request / invoice_request / verify_request + parse_*
@@ -87,7 +87,7 @@ verify_note_signature(k1, domain, amount_msat, sig, mint_pubkey) -> bool
   = check_note(..).is_verified(). DOMAIN IS REQUIRED: Q and the cs1 are both
   public, so ck1<Q||junk> beside a real cs1 would otherwise pass.
 check_note_url(note_url, mint_pubkey)   the same, read off
-  ...?k1=<spend>&sig=<cs1> (domain from the URL, amount from cs1 or amount=)
+  ...?k1=<spend>&c=<cs1> (legacy &sig= still read) (domain from the URL, amount from cs1 or amount=)
 check_note_certificate(cp1 or bearer h, amount, sig, mint_pubkey) ->
   Option<CertifiedOver::{OutputKey, LegacyHash}>   LegacyHash = a
   pre-taproot certificate over h
@@ -140,10 +140,11 @@ derive_cash_address_node(root, host) -> CashNode   the domain node itself:
   m/139'/d1/d2/d3/d4, hashing key m/139'/0, the spec text's literal path.
   Derived from the host AS STORED (port included); spends bind the hostname
 cash_node_to_cx1(node) -> Cx1
-derive_note_pubkey(P, chain_code, i) -> Q      watch-only, BIP-341 style
-  tweak; i any u32, 4-byte big-endian, never hardened. t is reduced mod n;
+derive_note_pubkey(P, chain_code, purpose, i) -> Q   watch-only, BIP-341 style
+  tweak over ser32(purpose)||ser32(i); purpose = PURPOSE_WALLET 0, PURPOSE_CHANGE 1,
+  PURPOSE_LIGHTNING_ADDRESS 2 (registration proof and address key: purpose 0, index 0); i any u32, 4-byte big-endian, never hardened. t is reduced mod n;
   a key at infinity is an error: use the next index. Q is used as is, no BIP-86 tweak
-derive_note_secret_key(p, chain_code, i) -> sk   negates p first when P has
+derive_note_secret_key(p, chain_code, purpose, i) -> sk   negates p first when P has
   odd y
 sign_note_ownership(sk, domain) -> [u8; 96]   Q || BIP-340 over
   key_path_sighash(Q, domain), zero aux_rand: one ck1 per key per mint,

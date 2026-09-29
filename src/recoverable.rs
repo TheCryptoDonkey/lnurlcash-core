@@ -347,15 +347,26 @@ pub fn is_cx1(value: &str) -> bool {
 
 // ---- the per-note key tweak ----
 //
-//   t    = tagged_hash("LNURLcash/derive", P || chainCode || ser32_be(i))
+//   t    = tagged_hash("LNURLcash/derive", P || chainCode || ser32(purpose) || ser32(i))
 //   pk_i = x(lift_x(P) + t*G)
 //   sk_i = ((P has even y ? p : n - p) + t) mod n
 //
 // BIP-341's taproot tweak, so a watcher holding only the `cx1` computes the
 // same `pk_i` the holder does, and libsecp256k1 already implements both
-// halves of it. `i` is any u32 and is never hardened. The 4-byte big-endian
-// width is what lnurl-wallet and lnurl-mint both use; the draft text does not
-// pin it.
+// halves of it. `purpose` and `i` are any u32 and never hardened, each a
+// 4-byte big-endian word. `purpose` splits a branch into three independent
+// counters, so a wallet's own indices and a SERVICE's auto-minted ones can
+// never collide by coincidence.
+
+/// Purpose 0: every note the wallet itself mints, rotates into or merges
+/// into, and a split's resulting note `p1`. The registration proof and the
+/// address key are index 0 on this purpose.
+pub const PURPOSE_WALLET: u32 = 0;
+/// Purpose 1: a split's change note `p2`.
+pub const PURPOSE_CHANGE: u32 = 1;
+/// Purpose 2: a note credited by Lightning Address auto-mint or an internal
+/// transfer, whichever rail delivered it.
+pub const PURPOSE_LIGHTNING_ADDRESS: u32 = 2;
 
 const NOTE_DERIVE_TAG: &str = "LNURLcash/derive";
 
@@ -365,10 +376,20 @@ fn unusable(index: u32) -> Error {
     ))
 }
 
-fn tweak_for(pubkey_x_only: &[u8; 32], chain_code: &[u8; 32], index: u32) -> Result<Scalar> {
+fn tweak_for(
+    pubkey_x_only: &[u8; 32],
+    chain_code: &[u8; 32],
+    purpose: u32,
+    index: u32,
+) -> Result<Scalar> {
     let t = tagged_hash(
         NOTE_DERIVE_TAG,
-        &[pubkey_x_only, chain_code, &index.to_be_bytes()],
+        &[
+            pubkey_x_only,
+            chain_code,
+            &purpose.to_be_bytes(),
+            &index.to_be_bytes(),
+        ],
     );
     Scalar::from_be_bytes(reduce_mod_n(t)).map_err(|_| unusable(index))
 }
@@ -383,19 +404,20 @@ fn reduce_mod_n(t: [u8; 32]) -> [u8; 32] {
         .into()
 }
 
-/// A note's public key at `index`, from the `cx1` half of a branch alone.
+/// A note's public key at `purpose` and `index`, from the `cx1` half of a branch alone.
 ///
 /// Watch-only: no private key anywhere, which is what lets a SERVICE holding a
 /// registered `cx1` mint straight to the holder's next key.
 pub fn derive_note_pubkey(
     branch_pubkey_x_only: &[u8; 32],
     chain_code: &[u8; 32],
+    purpose: u32,
     index: u32,
 ) -> Result<[u8; 32]> {
     let secp = Secp256k1::verification_only();
     let branch = XOnlyPublicKey::from_slice(branch_pubkey_x_only)
         .map_err(|_| Error::Protocol("a branch key is not an x-only secp256k1 point".into()))?;
-    let tweak = tweak_for(branch_pubkey_x_only, chain_code, index)?;
+    let tweak = tweak_for(branch_pubkey_x_only, chain_code, purpose, index)?;
     // lift_x(P) + t*G, refusing the point at infinity
     let (note, _parity) = branch
         .add_tweak(&secp, &tweak)
@@ -412,6 +434,7 @@ pub fn derive_note_pubkey(
 pub fn derive_note_secret_key(
     branch_private_key: &[u8; 32],
     chain_code: &[u8; 32],
+    purpose: u32,
     index: u32,
 ) -> Result<[u8; 32]> {
     let secp = Secp256k1::new();
@@ -419,7 +442,7 @@ pub fn derive_note_secret_key(
         Error::Protocol("a branch private key is a 32-byte scalar in [1, n)".into())
     })?;
     let (branch_x, _parity) = branch.x_only_public_key();
-    let tweak = tweak_for(&branch_x.serialize(), chain_code, index)?;
+    let tweak = tweak_for(&branch_x.serialize(), chain_code, purpose, index)?;
     let note = branch
         .add_xonly_tweak(&secp, &tweak)
         .map_err(|_| unusable(index))?;
@@ -906,9 +929,9 @@ mod tests {
     fn signing_refuses_a_key_outside_the_curve_order() {
         assert!(sign_note_ownership(&[0; 32], DOMAIN).is_err());
         assert!(sign_note_ownership(&[0xff; 32], DOMAIN).is_err());
-        assert!(derive_note_secret_key(&[0; 32], &[0; 32], 0).is_err());
+        assert!(derive_note_secret_key(&[0; 32], &[0; 32], 0, 0).is_err());
         // above the field prime, so not an x coordinate at all
-        assert!(derive_note_pubkey(&[0xff; 32], &[0; 32], 0).is_err());
+        assert!(derive_note_pubkey(&[0xff; 32], &[0; 32], 0, 0).is_err());
     }
 
     #[test]
@@ -926,9 +949,11 @@ mod tests {
         let cx1 = cash_node_to_cx1(&node).expect("cx1");
         for index in [0, 1, 0x7fff_ffff, 0x8000_0000, u32::MAX] {
             let pubkey =
-                derive_note_pubkey(&cx1.pubkey_x_only, &cx1.chain_code, index).expect("pubkey");
+                derive_note_pubkey(&cx1.pubkey_x_only, &cx1.chain_code, PURPOSE_WALLET, index)
+                    .expect("pubkey");
             let secret =
-                derive_note_secret_key(&node.private_key, &node.chain_code, index).expect("sk");
+                derive_note_secret_key(&node.private_key, &node.chain_code, PURPOSE_WALLET, index)
+                    .expect("sk");
             let signature = sign_note_ownership(&secret, DOMAIN).expect("signs");
             assert_eq!(
                 recover_note_ownership_pubkey(&signature, DOMAIN).map(|owner| owner.pubkey_x_only),

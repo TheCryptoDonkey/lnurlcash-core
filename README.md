@@ -251,8 +251,9 @@ let node = derive_cash_address_node(&derive_cash_root(&seed)?, "mint.example")?;
 let branch = cash_node_to_cx1(&node)?;
 let cx1 = encode_cx1(&branch.pubkey_x_only, &branch.chain_code); // watch-only
 
-let pk = derive_note_pubkey(&branch.pubkey_x_only, &branch.chain_code, i)?; // what a watcher derives
-let sk = derive_note_secret_key(&node.private_key, &node.chain_code, i)?;
+// purpose: PURPOSE_WALLET (0), PURPOSE_CHANGE (1) or PURPOSE_LIGHTNING_ADDRESS (2)
+let pk = derive_note_pubkey(&branch.pubkey_x_only, &branch.chain_code, PURPOSE_WALLET, i)?; // what a watcher derives
+let sk = derive_note_secret_key(&node.private_key, &node.chain_code, PURPOSE_WALLET, i)?;
 let ck1 = encode_ck1(&sign_note_ownership(&sk, note_url)?); // spends it at this mint only
 
 let cs1 = encode_cs1_with_amount(amount_msat, &mint_signature);
@@ -271,8 +272,22 @@ certificate from a mint that predates taproot is over a bearer note's `h`
 rather than its `Q`; `check_note` and `check_note_certificate` still read it,
 and say so (`CertifiedOver::LegacyHash`).
 
-Registering or unregistering a Lightning Address uses the branch's index-0
-private key. `sign_address_proof(&sk0, action, domain, username)` returns the
+A note's tweak is `tagged_hash("LNURLcash/derive", P || chaincode ||
+ser32(purpose) || ser32(i))`. `purpose` keeps three counters apart on one
+branch: `PURPOSE_WALLET` (0) for the wallet's own notes and a split's `p1`,
+`PURPOSE_CHANGE` (1) for a split's change `p2`, and
+`PURPOSE_LIGHTNING_ADDRESS` (2) for notes a SERVICE credits by Lightning
+Address auto-mint or internal transfer. One `cx1` covers all three; scan each
+with its own gap limit on restore.
+
+Certificates travel as `c` (and `c2` for a split's change) in withdraw
+responses and the informational GET, and a certified note URL carries
+`&c=<cs1>`. Reading still accepts the legacy `sig`, `sig2` and `&sig=`; only
+`c`, `c2` and `&c=` are written. The registration proof's request parameter
+stays `sig`.
+
+Registering or unregistering a Lightning Address uses the branch's purpose-0
+index-0 private key. `sign_address_proof(&sk0, action, domain, username)` returns the
 raw 64-byte BIP-340 proof over
 `sha256("LNURLcash:<action>:<domain>:<username>")` (`address_proof_message`
 builds the string, `address_proof_digest` the 32 bytes that are signed);

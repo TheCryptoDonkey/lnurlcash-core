@@ -120,7 +120,7 @@ pub struct NoteInfoByHash {
     pub min_withdrawable: u64,
     pub default_description: Option<String>,
     pub mint_pubkey: Option<String>,
-    /// `sig`: the SERVICE's `cs1` for the queried note, as sent and
+    /// `c`: the SERVICE's `cs1` for the queried note, as sent and
     /// unverified. Check it with [`crate::check_note_certificate`] against
     /// what was looked up.
     pub signature: Option<String>,
@@ -137,7 +137,7 @@ pub struct WithdrawRequestInfo {
     /// ever `None` when the caller set [`Policy::require_mint_pubkey`] to
     /// false.
     pub mint_pubkey: Option<String>,
-    /// `sig`: the SERVICE's `cs1` for the queried note, as sent and
+    /// `c`: the SERVICE's `cs1` for the queried note, as sent and
     /// unverified. Check it with [`crate::check_note`] against the spend and
     /// `max_withdrawable`.
     pub signature: Option<String>,
@@ -241,11 +241,11 @@ pub struct VerifyResult {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MutationResponse {
-    /// `sig`: the `cs1` certificate for `p1`. Always present for a `cp1`
+    /// `c`: the `cs1` certificate for `p1`. Always present for a `cp1`
     /// output. For a bearer output named by its hash, `None` from a mint with
     /// no signer, unless [`Policy::require_signatures`] demanded it.
     pub signature: Option<String>,
-    /// `sig2`, the same for a split's change.
+    /// `c2`, the same for a split's change.
     pub change_signature: Option<String>,
     /// LUD-25 melt proof (optional), present only on a melt.
     pub pr: Option<String>,
@@ -328,7 +328,7 @@ fn reject_error(body: &Value) -> Result<()> {
 
 /// LUD-03 step one. Never burns, rotates or alters the note.
 ///
-/// `sig` is stripped before the request: it is only meaningful to a holder
+/// The certificate (`c`, or legacy `sig`) is stripped before the request: it is only meaningful to a holder
 /// inspecting the note locally, since the SERVICE already knows what it signed.
 /// `k1` and `amount` are left as they are.
 pub fn note_info_request(url: &str) -> Result<Request> {
@@ -336,7 +336,7 @@ pub fn note_info_request(url: &str) -> Result<Request> {
         .map_err(|_| Error::RequestRefused("that note URL does not parse".into()))?;
     let pairs: Vec<(String, String)> = parsed
         .query_pairs()
-        .filter(|(k, _)| k != "sig")
+        .filter(|(k, _)| k != "c" && k != "sig")
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .collect();
     parsed.set_query(None);
@@ -394,7 +394,7 @@ pub fn parse_note_info(
         min_withdrawable,
         default_description: as_str(body, "defaultDescription"),
         mint_pubkey: mint_pubkey.map(|key| key.trim().to_ascii_lowercase()),
-        signature: as_str(body, "sig").filter(|sig| !sig.is_empty()),
+        signature: certificate(body, "c", "sig"),
     })
 }
 
@@ -470,7 +470,7 @@ pub fn parse_note_info_by_hash(body: &Value, policy: Policy) -> Result<NoteInfoB
         min_withdrawable,
         default_description: as_str(body, "defaultDescription"),
         mint_pubkey: mint_pubkey.map(|key| key.trim().to_ascii_lowercase()),
-        signature: as_str(body, "sig").filter(|sig| !sig.is_empty()),
+        signature: certificate(body, "c", "sig"),
     })
 }
 
@@ -655,6 +655,15 @@ pub fn merge_request(callback: &str, k1s: &[String], new_secret: &str) -> Result
     Ok(request)
 }
 
+/// A certificate field, by its current name, else the legacy one that LUD-25
+/// used before 50d740a (`sig`, `sig2`). Read only: nothing here writes the
+/// legacy names.
+fn certificate(body: &Value, current: &str, legacy: &str) -> Option<String> {
+    as_str(body, current)
+        .filter(|s| !s.is_empty())
+        .or_else(|| as_str(body, legacy).filter(|s| !s.is_empty()))
+}
+
 /// Classify a mutating callback's response.
 ///
 /// A 200 that does not confirm is [`Error::Ambiguous`], not a failure: the
@@ -663,7 +672,7 @@ pub fn merge_request(callback: &str, k1s: &[String], new_secret: &str) -> Result
 /// `outputs` is [`Request::outputs`] from the request this answers, and says
 /// what each output is owed:
 ///
-/// - A `cp1` output is owed its `cs1` certificate, in `sig` (`sig2` for a
+/// - A `cp1` output is owed its `cs1` certificate, in `c` (`c2` for a
 ///   split's change), whatever the [`Policy`] says. One that comes back
 ///   without it is [`Error::Unverifiable`]: the note exists at the key the
 ///   WALLET disclosed, but nobody can check it offline, which is the whole
@@ -690,8 +699,8 @@ pub fn parse_mutation(
             "the service did not confirm the operation - it may still have been applied",
         ));
     }
-    let signature = as_str(body, "sig").filter(|s| !s.is_empty());
-    let change_signature = as_str(body, "sig2").filter(|s| !s.is_empty());
+    let signature = certificate(body, "c", "sig");
+    let change_signature = certificate(body, "c2", "sig2");
     // The mutation has already landed by the time this is checked - `status`
     // was OK - so the caller of this function must attach the fresh secrets
     // to the error, or enforcing the spec becomes the thing that loses the
@@ -1006,7 +1015,7 @@ mod tests {
             );
         }
         let err = parse_mutation(
-            &json!({"status": "OK", "sig": "ab".repeat(65)}),
+            &json!({"status": "OK", "c": "ab".repeat(65)}),
             MutationKind::Split,
             &two,
             strict(),
@@ -1015,8 +1024,17 @@ mod tests {
         assert!(matches!(err, Error::Unverifiable { .. }), "{err:?}");
         assert!(err.to_string().contains("split's change"), "{err}");
         // signed throughout, it is fine
-        let both = json!({"status": "OK", "sig": "ab".repeat(65), "sig2": "cd".repeat(65)});
+        let both = json!({"status": "OK", "c": "ab".repeat(65), "c2": "cd".repeat(65)});
         assert!(parse_mutation(&both, MutationKind::Split, &two, strict()).is_ok());
+        // a SERVICE still on the pre-50d740a names is read, never written
+        let legacy = json!({"status": "OK", "sig": "ab".repeat(65), "sig2": "cd".repeat(65)});
+        let read = parse_mutation(&legacy, MutationKind::Split, &two, strict()).unwrap();
+        assert_eq!(read.signature, Some("ab".repeat(65)));
+        assert_eq!(read.change_signature, Some("cd".repeat(65)));
+        // and the current name wins when both are present
+        let mixed = json!({"status": "OK", "c": "ab".repeat(65), "sig": "ef".repeat(65)});
+        let read = parse_mutation(&mixed, MutationKind::Rotate, &one, strict()).unwrap();
+        assert_eq!(read.signature, Some("ab".repeat(65)));
         // and a melt mints nothing, so it owes nothing under any policy
         assert!(parse_mutation(&ok, MutationKind::Melt, &[], strict()).is_ok());
     }

@@ -6,10 +6,29 @@ carry breaking changes; pin an exact version.
 ## 0.2.0 - unreleased
 
 Breaking. Follows LUD-25's unified taproot model (lnurl/luds `6e865b1`,
-"unified taproot verification") and grades against `lnurlcash-conformance`
-0.14.0. The two `ck1` changes further down never reached a release and are
+"unified taproot verification"), updated to luds `50d740a` (derivation
+purposes, `c`/`c2` certificates), and grades against `lnurlcash-conformance`
+0.15.0. The two `ck1` changes further down never reached a release and are
 superseded here: a `ck1` now signs a domain-bound sighash, not a fixed
 message.
+
+### LUD-25 at 50d740a: purposes, `c`, `cpub`
+
+- Derivation gains a purpose:
+  `t = tagged_hash("LNURLcash/derive", P || chaincode || ser32(purpose) || ser32(i))`.
+  `derive_note_pubkey` and `derive_note_secret_key` (and their FFI
+  counterparts) take `purpose` before `index`. Constants
+  `recoverable::PURPOSE_WALLET` (0), `PURPOSE_CHANGE` (1) and
+  `PURPOSE_LIGHTNING_ADDRESS` (2). Keys derived without a purpose no longer
+  match, so a wallet must migrate notes it holds under the old tweak. The
+  registration proof and the address key are purpose 0, index 0.
+- Certificates are `c` (and `c2` for a split's change) in withdraw responses
+  and on the informational GET, and a certified note URL carries `&c=<cs1>`.
+  Parsing still reads the legacy `sig`, `sig2` and `&sig=` (the current name
+  wins when both are present); nothing writes them. The registration proof's
+  request parameter stays `sig`.
+- The `text/cpub` metadata entry replaces `text/xpub`. This crate does not
+  parse metadata for it, so there is nothing to change here.
 
 ### Every note is a taproot output key
 
@@ -147,7 +166,7 @@ Over the FFI (for lnurlcash-kotlin to follow):
   `script_path_sighash` take the exact domain string; everything else taking
   a domain accepts a URL or host.
 
-Graded against `lnurlcash-conformance` 0.14.0: spec vectors 1 to 5, every
+Graded against `lnurlcash-conformance` 0.15.0: spec vectors 1 to 5, every
 section of `spends.json`, and `part2.json` and `nostr-seed.json` with their
 domain-bound `sighash` and `keyPathSignature`. `signature.json` still certifies
 over `h` and is read through the legacy path. Against the mock mint: a
@@ -155,7 +174,7 @@ key-path note spent by a `ck1` bound to its host, the same key's `ck1` for
 another domain refused, a bearer note's full `cw1` spending it like its
 preimage, `?p=` lookups by `h` and by `cp1` with their certificates, `already
 in use`, and a pre-taproot certificate over `h` read as legacy. CI pins
-conformance `v0.14.0`.
+conformance `v0.15.0`.
 
 Docs: README, llms.txt and doc comments now describe the literal `m/139'/d1/d2/d3/d4` address branch, the sha256-digest ownership and address proofs, and no Part 1 secret ladder.
 
