@@ -489,19 +489,15 @@ pub fn check_leaf(leaf_version: u8, script: &[u8]) -> Option<&'static str> {
         // walk, since Bitcoin Core fails such a script by itself
         let skip = match op {
             1..=75 => usize::from(op),
-            0x4c => match script.get(i) {
-                Some(&len) => 1 + usize::from(len),
-                None => return None,
-            },
-            0x4d => match script.get(i..i + 2) {
-                Some(len) => 2 + usize::from(u16::from_le_bytes([len[0], len[1]])),
-                None => return None,
-            },
-            0x4e => match script.get(i..i + 4) {
-                Some(len) => 4usize
-                    .saturating_add(u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize),
-                None => return None,
-            },
+            0x4c => 1 + usize::from(*script.get(i)?),
+            0x4d => {
+                let len = script.get(i..i + 2)?;
+                2 + usize::from(u16::from_le_bytes([len[0], len[1]]))
+            }
+            0x4e => {
+                let len = script.get(i..i + 4)?;
+                4usize.saturating_add(u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize)
+            }
             op if is_op_success(op) => return Some("leaf uses a reserved OP_SUCCESS opcode"),
             _ => 0,
         };
