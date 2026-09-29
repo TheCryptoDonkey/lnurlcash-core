@@ -3,7 +3,7 @@
 Semantic versioning. While the LUD-25 draft is unmerged, `0.x` minor bumps may
 carry breaking changes; pin an exact version.
 
-## 0.2.0 - unreleased
+## 0.2.0 - 2026-09-29
 
 Breaking. Follows LUD-25's unified taproot model (lnurl/luds `6e865b1`,
 "unified taproot verification"), updated to luds `50d740a` (derivation
