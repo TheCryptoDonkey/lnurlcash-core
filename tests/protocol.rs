@@ -12,8 +12,14 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use lnurlcash_core::client::{Client, ClientConfig, NoteFate};
-use lnurlcash_core::protocol::Policy;
-use lnurlcash_core::{build_note_url, hash_k1, verify_note_signature, Error};
+use lnurlcash_core::protocol::{parse_mutation, rotate_request_with_hash, MutationKind, Policy};
+use lnurlcash_core::recoverable::{encode_ck1, encode_cp1, encode_cw1, sign_note_ownership};
+use lnurlcash_core::spend::bearer_cw1;
+use lnurlcash_core::{
+    build_note_url, check_note, check_note_certificate, check_note_url, check_spend, hash_k1,
+    note_id_of, note_lookup_of, verify_note_signature, with_new_k1, CertifiedOver, Error,
+    SpendVerdict,
+};
 use serde_json::Value;
 
 struct MockMint {
@@ -114,8 +120,18 @@ impl MockMint {
         body["sig"].as_str().map(str::to_string)
     }
 
+    /// Bring a note into existence at an output: a `cp1`, or a bearer note's
+    /// hash. Returns the certificate the mint issued.
+    async fn credit_output(&self, output: &str, amount_msat: u64) -> Option<String> {
+        let body = self
+            .hook(&format!("/_test/credit?p={output}&amount={amount_msat}"))
+            .await;
+        assert_eq!(body["status"], "OK", "credit failed: {body}");
+        body["sig"].as_str().map(str::to_string)
+    }
+
     /// What the SERVICE thinks of a note - the difference between what a mint
-    /// says and what it did.
+    /// says and what it did. `k1` is any spend of it.
     async fn note_state(&self, k1: &str) -> Option<String> {
         let body = self.hook(&format!("/_test/state?k1={k1}")).await;
         body["state"].as_str().map(str::to_string)
@@ -252,12 +268,14 @@ async fn rotate_burns_the_old_secret_and_mints_one_the_service_never_saw() {
     let signature = rotated.signature.expect("mint signs");
     assert!(verify_note_signature(
         &rotated.k1,
+        &mint.url,
         21000,
         &signature,
         &mint.pubkey
     ));
     assert!(!verify_note_signature(
         &rotated.k1,
+        &mint.url,
         21001,
         &signature,
         &mint.pubkey
@@ -275,6 +293,7 @@ async fn accepts_the_other_recovery_id_layout() {
     let signature = rotated.signature.expect("mint signs");
     assert!(verify_note_signature(
         &rotated.k1,
+        &mint.url,
         21000,
         &signature,
         &mint.pubkey
@@ -328,6 +347,7 @@ async fn split_produces_an_amount_and_its_change() {
     );
     assert!(verify_note_signature(
         &result.k1,
+        &mint.url,
         5000,
         &result.signature.unwrap(),
         &mint.pubkey
@@ -1077,9 +1097,200 @@ async fn a_lying_service_cannot_inflate_past_what_it_signed() {
     // not verify - an offline holder catches this without asking anyone
     assert!(!verify_note_signature(
         &k1,
+        &mint.url,
         info.max_withdrawable,
         &signature,
         &mint.pubkey
     ));
-    assert!(verify_note_signature(&k1, 21000, &signature, &mint.pubkey));
+    assert!(verify_note_signature(
+        &k1,
+        &mint.url,
+        21000,
+        &signature,
+        &mint.pubkey
+    ));
+}
+
+// ---- every note is a taproot output key ----
+//
+// The mock mint keys notes by hex(Q), verifies every spend in full - a ck1
+// against the hostname it was reached at, a cw1 by the leaf and time rules and
+// then its script - and certifies every note over hex(Q).
+
+async fn get_json(url: &str) -> Value {
+    let text = reqwest::get(url)
+        .await
+        .expect("the mint is reachable")
+        .text()
+        .await
+        .expect("a body");
+    serde_json::from_str(&text).expect("JSON")
+}
+
+fn cp1_of(note_id: &str) -> String {
+    encode_cp1(
+        &hex::decode(note_id)
+            .expect("hex")
+            .try_into()
+            .expect("32 bytes"),
+    )
+}
+
+#[tokio::test]
+async fn a_key_path_note_spends_by_a_ck1_bound_to_its_mint() {
+    let mint = mint_or_skip!(&[]);
+    let client = Client::new();
+    // signed for the note URL's own host, as a wallet holding the URL does
+    let ck1 = encode_ck1(&sign_note_ownership(&[0x31; 32], &mint.url).expect("signs"));
+    mint.credit_output(&cp1_of(&note_id_of(&ck1).expect("an id")), 21000)
+        .await;
+
+    let info = client.fetch_note_info(&mint.note_url(&ck1)).await.unwrap();
+    assert_eq!(info.max_withdrawable, 21000);
+    // The informational GET certifies the note it was asked about, over
+    // hex(Q), and the wallet can check both halves of that offline.
+    let sig = info.signature.clone().expect("certified");
+    let check = check_note(&ck1, &mint.url, 21000, &sig, &mint.pubkey).expect("certified");
+    assert_eq!(check.certificate, CertifiedOver::OutputKey);
+    assert_eq!(check.spend, SpendVerdict::Opens);
+
+    let rotated = client.rotate_note(&info.callback, &ck1).await.unwrap();
+    assert_eq!(mint.note_state(&ck1).await.as_deref(), Some("burned"));
+    // the rotated bearer note, as a certified note URL, checks out offline
+    let url = with_new_k1(
+        &mint.note_url(&ck1),
+        &rotated.k1,
+        21000,
+        rotated.signature.as_deref(),
+    )
+    .expect("a note URL");
+    let check = check_note_url(&url, &mint.pubkey).expect("a certified note");
+    assert!(check.is_verified(), "{check:?}");
+    assert_eq!(check.certificate, CertifiedOver::OutputKey);
+}
+
+#[tokio::test]
+async fn a_ck1_bound_to_another_mint_opens_nothing_here() {
+    let mint = mint_or_skip!(&[]);
+    let client = Client::new();
+    let here = encode_ck1(&sign_note_ownership(&[0x32; 32], &mint.url).expect("signs"));
+    let elsewhere = encode_ck1(&sign_note_ownership(&[0x32; 32], "mint.example").expect("signs"));
+    assert_eq!(note_id_of(&here), note_id_of(&elsewhere), "one note");
+    mint.credit_output(&cp1_of(&note_id_of(&here).expect("an id")), 21000)
+        .await;
+
+    // offline, the wallet can already tell
+    assert!(matches!(
+        check_spend(&elsewhere, &mint.url).map(|check| check.verdict),
+        Some(SpendVerdict::Fails(_))
+    ));
+    // and the mint agrees, at the informational GET and at the callback
+    assert!(client
+        .fetch_note_info(&mint.note_url(&elsewhere))
+        .await
+        .is_err());
+    let err = client
+        .rotate_note(&mint.callback(), &elsewhere)
+        .await
+        .unwrap_err();
+    assert!(err.is_definitive(), "got {err:?}");
+    assert_eq!(mint.note_state(&here).await.as_deref(), Some("outstanding"));
+}
+
+#[tokio::test]
+async fn a_bearer_notes_full_cw1_is_the_same_spend_as_its_preimage() {
+    let mint = mint_or_skip!(&[]);
+    let client = Client::new();
+    let k1 = secret(60);
+    mint.credit(&k1, 21000).await;
+    let cw1 =
+        encode_cw1(&bearer_cw1(&hex::decode(&k1).expect("hex")).expect("a cw1")).expect("encodes");
+    assert_eq!(note_id_of(&cw1), note_id_of(&k1));
+
+    let info = client.fetch_note_info(&mint.note_url(&cw1)).await.unwrap();
+    assert_eq!(info.max_withdrawable, 21000);
+    let rotated = client.rotate_note(&info.callback, &cw1).await.unwrap();
+    // burned, whichever spelling asks
+    assert_eq!(mint.note_state(&k1).await.as_deref(), Some("burned"));
+    assert_eq!(
+        mint.note_state(&rotated.k1).await.as_deref(),
+        Some("outstanding")
+    );
+}
+
+#[tokio::test]
+async fn looks_a_note_up_by_p_without_its_spend() {
+    let mint = mint_or_skip!(&[]);
+    let client = Client::new();
+    let k1 = secret(61);
+    mint.credit(&k1, 21000).await;
+    let withdraw_link = format!("{}/w", mint.url);
+
+    let h = note_lookup_of(&k1).expect("a lookup");
+    assert_eq!(h, hash_k1(&k1).expect("hash"));
+    let cp1 = cp1_of(&note_id_of(&k1).expect("an id"));
+    for reference in [h, cp1] {
+        let info = client
+            .fetch_note_info_by_hash(&withdraw_link, &reference)
+            .await
+            .unwrap_or_else(|err| panic!("{reference}: {err}"));
+        assert_eq!(info.max_withdrawable, 21000);
+        let sig = info.signature.expect("certified");
+        assert_eq!(
+            check_note_certificate(&reference, 21000, &sig, &mint.pubkey),
+            Some(CertifiedOver::OutputKey),
+            "{reference}"
+        );
+    }
+    // asking spent nothing
+    assert_eq!(mint.note_state(&k1).await.as_deref(), Some("outstanding"));
+}
+
+#[tokio::test]
+async fn an_output_already_in_use_is_refused_and_nothing_burns() {
+    let mint = mint_or_skip!(&[]);
+    let (k1, taken) = (secret(62), secret(63));
+    mint.credit(&k1, 21000).await;
+    mint.credit(&taken, 1000).await;
+
+    // the note at the output is somebody's, named by its hash or its cp1
+    for output in [
+        hash_k1(&taken).expect("hash"),
+        cp1_of(&note_id_of(&taken).expect("an id")),
+    ] {
+        let request = rotate_request_with_hash(&mint.callback(), &k1, &output).expect("builds");
+        let body = get_json(&request.url).await;
+        let err = parse_mutation(
+            &body,
+            MutationKind::Rotate,
+            &request.outputs,
+            Policy::default(),
+        )
+        .unwrap_err();
+        assert!(err.is_output_in_use(), "{output}: {err:?}");
+        assert!(err.is_definitive(), "{output}");
+    }
+    assert_eq!(mint.note_state(&k1).await.as_deref(), Some("outstanding"));
+}
+
+#[tokio::test]
+async fn a_certificate_over_h_from_an_older_mint_still_verifies_as_legacy() {
+    let mint = mint_or_skip!(&["--certificateOverH=true"]);
+    let client = Client::new();
+    let k1 = secret(64);
+    mint.credit(&k1, 21000).await;
+
+    let rotated = client.rotate_note(&mint.callback(), &k1).await.unwrap();
+    let sig = rotated.signature.expect("certified");
+    let check = check_note(&rotated.k1, &mint.url, 21000, &sig, &mint.pubkey)
+        .expect("a pre-taproot certificate is still a certificate");
+    assert_eq!(check.certificate, CertifiedOver::LegacyHash);
+    assert!(check.is_verified());
+    assert!(verify_note_signature(
+        &rotated.k1,
+        &mint.url,
+        21000,
+        &sig,
+        &mint.pubkey
+    ));
 }

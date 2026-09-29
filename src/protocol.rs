@@ -13,29 +13,30 @@ use crate::fees::{parse_mint_fee, MintFee};
 use crate::note::note_k1;
 use crate::recoverable::{is_cp1, note_id_of};
 use crate::secrets::{hash_k1, is_preimage};
+use crate::spend::{check_spend, decode_note, spend_domain_of, SpendVerdict};
 use crate::urls::is_allowed_service_url;
 
 /// What this crate insists a SERVICE does, rather than merely hopes it does.
 ///
-/// The reference mint signs legacy hash outputs in raw Part 1 form when a
-/// signer is available, and may omit that proof in no-signer mode. A `cp1`
-/// output is owed its amount-bearing `cs1` certificate whatever this says -
-/// see [`parse_mutation`].
+/// LUD-25 has a SERVICE certify every note it issues with a `cs1` over
+/// `hex(Q)`, as a SHOULD, and one running without a signer omits them. A
+/// `cp1` output is owed its certificate whatever this says - see
+/// [`parse_mutation`] - while a bearer output named by its hash is owed one
+/// only when [`Policy::require_signatures`] asks.
 ///
 /// Build one from the default and change only what you mean to:
 /// `Policy { require_mint_pubkey: false, ..Policy::default() }`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Policy {
-    /// Demand the raw Part 1 signature over a legacy hash output, matching the
-    /// committed reference wallet. Off by default to admit the reference
-    /// mint's no-signer mode. With it on, an unsigned hash output is
+    /// Demand a certificate for a bearer output named by its hash, as well as
+    /// for a `cp1` one. Off by default to admit a mint running without a
+    /// signer. With it on, an uncertified bearer output is
     /// [`Error::Unverifiable`], carrying the fresh secrets.
     pub require_signatures: bool,
     /// Refuse a `withdrawRequest` that publishes no `mintPubkey`, or one that
-    /// is not a 33-byte compressed key: the key a `cp1` note's certificate
-    /// verifies against. On by default. Turn it off only for a Part 1-only
-    /// mint that publishes none, knowing that nothing it issues can then be
-    /// checked offline.
+    /// is not a 33-byte compressed key: the key every certificate verifies
+    /// against. On by default. Turn it off only for a mint that publishes
+    /// none, knowing that nothing it issues can then be checked offline.
     pub require_mint_pubkey: bool,
 }
 
@@ -77,14 +78,14 @@ pub fn is_compressed_pubkey(value: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct Request {
     pub url: String,
-    /// Fresh WALLET-generated secrets this request disclosed the hashes of. If
-    /// the outcome turns out to be unknown they may be the only copies of notes
-    /// the SERVICE has already minted.
+    /// Fresh WALLET-generated preimages this request disclosed the hashes of.
+    /// If the outcome turns out to be unknown they may be the only copies of
+    /// notes the SERVICE has already minted.
     pub new_secrets: Vec<String>,
     /// The outputs a rotate, split or merge named, exactly as sent: `[output]`
     /// for a rotate or merge, `[output, change]` for a split, and empty for
-    /// every other request. Each is a hash or a Part 2 `cp1`, and which one
-    /// decides what the response owes it, so hand these to
+    /// every other request. Each is a `cp1` or a bearer note's hash, and which
+    /// one decides what the response owes it, so hand these to
     /// [`parse_mutation`] with the response. Not secret: they were on the URL.
     pub outputs: Vec<String>,
 }
@@ -106,12 +107,12 @@ impl Request {
     }
 }
 
-/// What a hash lookup returns. Deliberately NOT [`WithdrawRequestInfo`]: that
-/// type's `k1` is the bearer secret, and the whole point of asking by hash is
-/// that the caller already holds it and the SERVICE never sends it back. A
-/// conforming SERVICE omits `k1` here (LUD-03's convenience of echoing the
-/// queried value has nothing to echo), so a struct promising one would be
-/// promising something no answer contains.
+/// What a `?p=` lookup returns. Deliberately NOT [`WithdrawRequestInfo`]: that
+/// type's `k1` is the spend, and the whole point of asking by `p` is that the
+/// caller already holds it and the SERVICE never sends it back. A conforming
+/// SERVICE omits `k1` here (LUD-03's convenience of echoing the queried value
+/// has nothing to echo), so a struct promising one would be promising
+/// something no answer contains.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteInfoByHash {
     pub callback: String,
@@ -119,6 +120,10 @@ pub struct NoteInfoByHash {
     pub min_withdrawable: u64,
     pub default_description: Option<String>,
     pub mint_pubkey: Option<String>,
+    /// `sig`: the SERVICE's `cs1` for the queried note, as sent and
+    /// unverified. Check it with [`crate::check_note_certificate`] against
+    /// what was looked up.
+    pub signature: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,10 +133,14 @@ pub struct WithdrawRequestInfo {
     pub max_withdrawable: u64,
     pub min_withdrawable: u64,
     pub default_description: Option<String>,
-    /// The key a `cp1` note's certificate verifies against, and a Part 1
-    /// signature where a mint still issues one. Only ever `None` when the
-    /// caller set [`Policy::require_mint_pubkey`] to false.
+    /// The key every certificate this SERVICE issues verifies against. Only
+    /// ever `None` when the caller set [`Policy::require_mint_pubkey`] to
+    /// false.
     pub mint_pubkey: Option<String>,
+    /// `sig`: the SERVICE's `cs1` for the queried note, as sent and
+    /// unverified. Check it with [`crate::check_note`] against the spend and
+    /// `max_withdrawable`.
+    pub signature: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,9 +241,9 @@ pub struct VerifyResult {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MutationResponse {
-    /// `sig`. Always present for a `cp1` output: its `cs1` certificate. For a
-    /// plain hash output `None`, unless the mint still issues the old Part 1
-    /// signature over the hash.
+    /// `sig`: the `cs1` certificate for `p1`. Always present for a `cp1`
+    /// output. For a bearer output named by its hash, `None` from a mint with
+    /// no signer, unless [`Policy::require_signatures`] demanded it.
     pub signature: Option<String>,
     /// `sig2`, the same for a split's change.
     pub change_signature: Option<String>,
@@ -362,12 +371,12 @@ pub fn parse_note_info(
     if min_withdrawable > max_withdrawable {
         return Err(invalid());
     }
-    // Spec MUST: the response's k1 is the bearer secret itself, never a derived
+    // Spec MUST: the response's k1 is the echoed spend itself, never a derived
     // or opaque id. A SERVICE returning something else for the k1 it was queried
     // with is non-compliant - or the note was rotated by somebody else, which
     // matters more.
     if let Some(queried) = note_k1(queried_url) {
-        if !same_note(&k1, &queried) {
+        if !same_note(&k1, &queried, queried_url) {
             return Err(Error::Protocol(
                 "the service echoed back a different k1 than was queried - the note may have been redeemed elsewhere, or the service isn't spec-compliant".into(),
             ));
@@ -385,13 +394,14 @@ pub fn parse_note_info(
         min_withdrawable,
         default_description: as_str(body, "defaultDescription"),
         mint_pubkey: mint_pubkey.map(|key| key.trim().to_ascii_lowercase()),
+        signature: as_str(body, "sig").filter(|sig| !sig.is_empty()),
     })
 }
 
 /// The `mintPubkey` check both informational GETs make, when
-/// [`Policy::require_mint_pubkey`] asks for it. Its own option since the
-/// Part 2 rewrite: it used to ride on `require_signatures`, which now only
-/// governs what a plain hash output owes, and the two are unrelated.
+/// [`Policy::require_mint_pubkey`] asks for it. Its own option since
+/// key-path notes arrived: it used to ride on `require_signatures`, which now
+/// only governs what a bearer output owes, and the two are unrelated.
 fn check_mint_pubkey(mint_pubkey: Option<&str>, policy: Policy) -> Result<()> {
     if !policy.require_mint_pubkey || mint_pubkey.is_some_and(is_compressed_pubkey) {
         return Ok(());
@@ -405,20 +415,32 @@ fn check_mint_pubkey(mint_pubkey: Option<&str>, policy: Policy) -> Result<()> {
     ))
 }
 
-/// Whether two k1s name one note. Exact spelling is preferred; valid `ck1`
-/// values may also be compared by their verified embedded note key. A k1 with
-/// no note id at all still has to come back as the same string.
-fn same_note(a: &str, b: &str) -> bool {
-    if a.trim().eq_ignore_ascii_case(b.trim()) {
+/// Whether an echoed k1 names the queried note. Exact spelling is preferred.
+/// Otherwise one note has many valid spends - its preimage and its full
+/// `cw1`, a `ck1` under an older scheme, another leaf - so another spend of
+/// the same `Q` is the same note, provided it does not demonstrably fail to
+/// open it at the queried URL's domain: a caller may copy the echo straight
+/// into the callback. A k1 that names no note still has to come back as the
+/// same string.
+fn same_note(echoed: &str, queried: &str, queried_url: &str) -> bool {
+    if echoed.trim().eq_ignore_ascii_case(queried.trim()) {
         return true;
     }
-    matches!((note_id_of(a), note_id_of(b)), (Some(x), Some(y)) if x == y)
+    let (Some(a), Some(b)) = (note_id_of(echoed), note_id_of(queried)) else {
+        return false;
+    };
+    let domain = spend_domain_of(queried_url).unwrap_or_default();
+    a == b
+        && !matches!(
+            check_spend(echoed, &domain).map(|check| check.verdict),
+            Some(SpendVerdict::Fails(_))
+        )
 }
 
-/// The same response, for a lookup that named the note by its hash.
+/// The same response, for a lookup that named the note by `?p=`.
 ///
 /// Differs from [`parse_note_info`] in exactly two places, both because there
-/// was no secret in the request: `k1` is not required in the response, and
+/// was no spend in the request: `k1` is not required in the response, and
 /// there is no echo to check against. Everything else - the shape, and the
 /// `mintPubkey` [`Policy::require_mint_pubkey`] asks for - is enforced
 /// identically, because a note nobody can verify offline is no more
@@ -448,6 +470,7 @@ pub fn parse_note_info_by_hash(body: &Value, policy: Policy) -> Result<NoteInfoB
         min_withdrawable,
         default_description: as_str(body, "defaultDescription"),
         mint_pubkey: mint_pubkey.map(|key| key.trim().to_ascii_lowercase()),
+        signature: as_str(body, "sig").filter(|sig| !sig.is_empty()),
     })
 }
 
@@ -530,45 +553,43 @@ pub fn melt_request(callback: &str, k1: &str, pr: &str) -> Result<Request> {
 //
 // The mutation behind rotate, split and merge, taking an output the caller
 // already holds rather than generating one: what a hardware wallet drives,
-// and how a note moves to a Part 2 key.
+// and how a note moves to a key.
 //
-// A k1 input may be a Part 1 secret or a Part 2 `ck1`; the SERVICE tells them
-// apart by shape, and both pass through untouched. An output may be a hash or
-// a Part 2 `cp1`. LUD-25 renamed the callback's `h`/`h2` to `p1`/`p2`: a hash
-// keeps the old names, which every mint that ever took one accepts, and a key
-// goes as `p1`/`p2`, which only a Part 2 mint takes anyway. Decided per
-// value, never by a version flag, which is the rule lnurl-wallet and the
-// TypeScript kit follow too.
+// A k1 input may be any spend - a 64-hex preimage, a `ck1` or a `cw1` - and
+// passes through untouched; the SERVICE tells them apart by shape. An output
+// is a `cp1`, or a bearer note's 64-hex hash, which is the `cp1` short form,
+// and either goes as `p1`/`p2`, LUD-25's names. A SERVICE still reads the
+// older `h`/`h2` for a hash, but nothing needs them any more: every mint that
+// reads `p1` reads a hash there too.
 //
-// The same per-value decision says what the response owes each output, so
-// every one of these records the outputs it named on `Request::outputs`, and
+// The kind of each output says what the response owes it, so every one of
+// these records the outputs it named on `Request::outputs`, and
 // [`parse_mutation`] reads them back.
 
-/// Whether an output names a Part 2 note. The one test both ends use: the
-/// parameter it is sent under, and what the response owes it.
+/// Whether an output names a note by its `cp1`: what decides whether the
+/// response owes it a certificate whatever the policy says.
 fn is_key_output(value: &str) -> bool {
     is_cp1(&value.trim().to_ascii_lowercase())
 }
 
-fn output_param(
-    value: &str,
-    hash_name: &'static str,
-    key_name: &'static str,
-) -> (&'static str, String) {
-    let name = if is_key_output(value) {
-        key_name
-    } else {
-        hash_name
-    };
-    (name, value.to_string())
+/// An output as it goes on the wire, refused before anything is sent unless
+/// it names a note: a `cp1` whose key is not a point, or anything that is
+/// neither, would have the SERVICE burn the inputs into a note no spend can
+/// ever open, at a mint that does not check.
+fn output_param(name: &'static str, value: &str) -> Result<(&'static str, String)> {
+    let value = value.trim();
+    if decode_note(value).is_none() {
+        return Err(Error::RequestRefused(format!(
+            "{name} must be a cp1 whose key is a curve point, or a bearer note's 64-hex hash - nothing was sent"
+        )));
+    }
+    Ok((name, value.to_string()))
 }
 
 pub fn rotate_request_with_hash(callback: &str, k1: &str, h: &str) -> Result<Request> {
+    let output = output_param("p1", h)?;
     Ok(Request::naming(
-        callback_url(
-            callback,
-            &[("k1", k1.to_string()), output_param(h, "h", "p1")],
-        )?,
+        callback_url(callback, &[("k1", k1.to_string()), output])?,
         &[h],
     ))
 }
@@ -582,23 +603,24 @@ pub fn split_request_with_hash(
 ) -> Result<Request> {
     let mut params: Vec<(&str, String)> = k1s.iter().map(|k1| ("k1", k1.clone())).collect();
     params.push(("amount", amount_msat.to_string()));
-    params.push(output_param(h, "h", "p1"));
-    params.push(output_param(h2, "h2", "p2"));
+    params.push(output_param("p1", h)?);
+    params.push(output_param("p2", h2)?);
     Ok(Request::naming(callback_url(callback, &params)?, &[h, h2]))
 }
 
 pub fn merge_request_with_hash(callback: &str, k1s: &[String], h: &str) -> Result<Request> {
     let mut params: Vec<(&str, String)> = k1s.iter().map(|k1| ("k1", k1.clone())).collect();
-    params.push(output_param(h, "h", "p1"));
+    params.push(output_param("p1", h)?);
     Ok(Request::naming(callback_url(callback, &params)?, &[h]))
 }
 
 // ---- the generating variants ----
 //
-// Per LUD-25 the WALLET generates the replacement secret and discloses only its
-// hash. The SERVICE never sees, generates or persists it, which is what closes
-// the prior-holder exposure a SERVICE-generated replacement would otherwise
-// reopen on every single rotate.
+// Per LUD-25 the WALLET generates the replacement note itself and discloses
+// only what names it: for the bearer notes these generate, a fresh preimage's
+// hash. The SERVICE never sees, generates or persists the preimage, which is
+// what closes the prior-holder exposure a SERVICE-generated replacement would
+// otherwise reopen on every single rotate.
 //
 // The secrets are passed in rather than drawn here, so a hardware wallet can
 // supply them from its own RNG and a test can be deterministic.
@@ -645,14 +667,15 @@ pub fn merge_request(callback: &str, k1s: &[String], new_secret: &str) -> Result
 ///   split's change), whatever the [`Policy`] says. One that comes back
 ///   without it is [`Error::Unverifiable`]: the note exists at the key the
 ///   WALLET disclosed, but nobody can check it offline, which is the whole
-///   reason to hold a `cp1` note.
-/// - A legacy hash output carries the reference mint's raw Part 1 signature
-///   when signing is available. [`Policy::require_signatures`] decides whether
-///   no-signer omission is accepted.
+///   reason to name a note by its key.
+/// - A bearer output named by its hash is certified over its `Q` by a mint
+///   with a signer. [`Policy::require_signatures`] decides whether a
+///   no-signer mint's omission is accepted.
 ///
-/// A signature that is present is returned as sent, for either kind: a mint
-/// still issuing the old Part 1 signature over a hash is fine wherever it
-/// verifies. An output missing from `outputs` is read as a hash.
+/// A signature that is present is returned as sent and unverified, for either
+/// kind: [`crate::check_note`] and [`crate::check_note_certificate`] check
+/// one, including a pre-taproot certificate over a bearer note's hash. An
+/// output missing from `outputs` is read as a hash.
 pub fn parse_mutation(
     body: &Value,
     kind: MutationKind,
@@ -682,7 +705,7 @@ pub fn parse_mutation(
             .is_some_and(|output| is_key_output(output))
         {
             return Err(Error::unverifiable(format!(
-                "the service confirmed the {what} to a cp1 output but returned no cs1 certificate, which LUD-25 Part 2 requires, so the note it just minted cannot be verified offline. The note exists - keep the key"
+                "the service confirmed the {what} to a cp1 output but returned no cs1 certificate, so the note it just minted cannot be verified offline. The note exists - keep the key"
             )));
         }
         if policy.require_signatures {
@@ -775,20 +798,22 @@ pub fn invoice_request(pay_callback: &str, amount_msat: u64) -> Result<Request> 
 
 /// Ask for a mint invoice, naming the note it will credit.
 ///
-/// `h` is `sha256(secret)` for a secret only the WALLET holds. LUD-25 carries
-/// it as a mandatory LUD-12 `comment`; `h` repeats the identical value for
-/// SERVICEs that took the parameter form first, which is what the vectors'
-/// `mintToHash` profile pins. It is never an alternative to the comment.
+/// `h` names the note: a `cp1<Q>`, or a bearer note's hash `sha256(preimage)`
+/// for a preimage only the WALLET holds, which is the `cp1` short form.
+/// LUD-25 carries it as a mandatory LUD-12 `comment`. For a hash, an `h`
+/// parameter repeats the identical value for SERVICEs that took the
+/// parameter form first, which is what the vectors' `mintToHash` profile
+/// pins; it is never an alternative to the comment, and a `cp1` goes as the
+/// comment alone.
 ///
-/// The SERVICE learns a hash and nothing else, so the payment preimage is
+/// The SERVICE learns `Q` and nothing else, so the payment preimage is
 /// settlement proof only - it can never redeem the note. That is the whole
 /// point of the current draft: a preimage propagates to every routing node
 /// that forwards the payment, and a note keyed by one is a note they can all
 /// spend.
 ///
-/// `h` may instead be a Part 2 `cp1`, minting the note to a key. That goes as
-/// the comment alone: `h` is a hash-only extension, and a mint may refuse a
-/// key under it.
+/// A `cp1` whose key is not a curve point is refused here, before any
+/// invoice exists: no spend could ever open the note it would mint.
 pub fn mint_invoice_request_with_hash(
     pay_callback: &str,
     amount_msat: u64,
@@ -803,7 +828,7 @@ pub fn mint_invoice_request_with_hash(
     // SERVICE was always going to reject.
     if !key && !is_preimage(&h) {
         return Err(Error::RequestRefused(
-            "an output commitment must be 32 bytes of hex or a cp1 key - no invoice was requested"
+            "an output commitment must be 32 bytes of hex or a cp1 whose key is a curve point - no invoice was requested"
                 .into(),
         ));
     }
@@ -826,9 +851,10 @@ pub fn mint_invoice_request_with_hash(
 /// The secret comes back on [`Request::new_secrets`]. **Persist it before
 /// paying the invoice this returns.** Paying for a note and then losing its
 /// secret is the one way the comment-bound scheme is worse than the preimage
-/// one it replaced, and persisting first removes it entirely. A Part 1 secret
-/// is plain randomness, never derived from the seed; for a note recoverable
-/// from the seed, mint to a Part 2 `cp1` with [`mint_invoice_request_with_hash`].
+/// one it replaced, and persisting first removes it entirely. A bearer
+/// note's preimage is plain randomness, never derived from the seed; for a
+/// note recoverable from the seed, mint to a key-path `cp1` with
+/// [`mint_invoice_request_with_hash`].
 pub fn mint_invoice_request(
     pay_callback: &str,
     amount_msat: u64,
@@ -956,7 +982,7 @@ mod tests {
         }
         // an output this was never told about is read as a hash
         assert!(parse_mutation(&ok, MutationKind::Rotate, &[], Policy::default()).is_ok());
-        // a Part 1 signature a mint still issues comes back as sent
+        // a signature a mint issues for a bearer output comes back as sent
         let signed = parse_mutation(
             &json!({"status": "OK", "sig": "ab".repeat(65)}),
             MutationKind::Rotate,

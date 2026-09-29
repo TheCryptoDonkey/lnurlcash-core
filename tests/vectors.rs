@@ -17,22 +17,29 @@ use lnurlcash_core::protocol::{
     MutationResponse, Policy, Request,
 };
 use lnurlcash_core::recoverable::{
-    cash_node_to_cx1, decode_ck1, decode_cp1, decode_cs1_with_amount, decode_cx1,
+    cash_node_to_cx1, decode_ck1, decode_cp1, decode_cs1_with_amount, decode_cw1, decode_cx1,
     derive_cash_address_node, derive_nostr_address_node, derive_nostr_cash_seed,
     derive_note_pubkey, derive_note_secret_key, encode_ck1, encode_cp1, encode_cs1_with_amount,
-    encode_cx1, is_ck1, is_cp1, is_cs1_with_amount, is_cx1, note_ownership_message,
-    recover_note_ownership_pubkey, sign_note_ownership, DecodedCk1, NOSTR_CASH_SEED_LABEL,
+    encode_cw1, encode_cx1, is_ck1, is_cp1, is_cs1_with_amount, is_cw1, is_cx1,
+    recover_note_ownership_pubkey, sign_note_ownership, Cw1, DecodedCk1, NOSTR_CASH_SEED_LABEL,
 };
 use lnurlcash_core::secrets::{derive_note_root, derive_note_secret};
+use lnurlcash_core::spend::{
+    bearer_cw1, bearer_leaf, bearer_note, check_leaf, check_spend, check_time_claim, decode_note,
+    decode_spend, key_path_sighash, output_key_of, script_path_sighash, spend_domain_of,
+    spend_prevout, spend_sig_msg, tagged_hash, tapbranch_hash, tapleaf_hash, taproot_tweak,
+    taproot_tweak_secret_key, Spend, SpendVerdict, NUMS_H, TAPLEAF_VERSION,
+};
 use lnurlcash_core::{
-    address_proof_message, apply_mint_fee, build_note_url, decode_bolt11_amount_msat,
-    format_fee_percent, from_bech32_lnurl, gross_up_for_mint_fee, is_allowed_service_url,
-    is_bolt11_invoice, is_preimage, lightning_address_username, mint_address_url,
-    note_declared_amount, note_id_of, note_k1, note_lookup_of, note_signature,
-    note_signature_digest, note_signature_digest_for_hash, note_signature_message,
-    note_signature_message_for_hash, parse_mint_fee, resolve_lnurl_input, resolve_mint_input,
-    resolve_note_input, same_invoice, sign_address_proof, to_bech32_lnurl, verify_note_signature,
-    verify_note_signature_hash, with_new_k1, without_k1, MintFee,
+    address_proof_digest, address_proof_message, apply_mint_fee, build_note_url, check_note,
+    check_note_certificate, check_note_url, decode_bolt11_amount_msat, format_fee_percent,
+    from_bech32_lnurl, gross_up_for_mint_fee, is_allowed_service_url, is_bolt11_invoice,
+    is_preimage, lightning_address_username, mint_address_url, note_declared_amount, note_id_of,
+    note_k1, note_lookup_of, note_signature, note_signature_digest, note_signature_digest_for_hash,
+    note_signature_message, note_signature_message_for_hash, parse_mint_fee, resolve_lnurl_input,
+    resolve_mint_input, resolve_note_input, same_invoice, sign_address_proof, to_bech32_lnurl,
+    verify_note_signature, verify_note_signature_hash, with_new_k1, without_k1, CertifiedOver,
+    MintFee,
 };
 use lnurlcash_core::{hash_k1, Error};
 use secp256k1::{Message, Parity, PublicKey, Secp256k1, SecretKey};
@@ -71,6 +78,11 @@ fn fee_of(value: &Value) -> MintFee {
     }
 }
 
+/// signature.json predates notes keyed by `Q`: every certificate there is
+/// over a bearer note's hash `h`, the message a mint signed before LUD-25
+/// moved certificates onto `hex(Q)`. The verdicts still hold through the
+/// legacy reading, reported as such; the message a current mint signs for
+/// the same note is over `Q` instead.
 #[test]
 fn signature_vectors() {
     let vectors = load("signature.json");
@@ -85,24 +97,50 @@ fn signature_vectors() {
         let pubkey = str_of(case, "mintPubkey");
         let expected = case["valid"].as_bool().expect("valid");
 
+        // a bearer preimage opens its note anywhere, so the domain is moot
         assert_eq!(
-            verify_note_signature(&k1, amount, &signature, &pubkey),
+            verify_note_signature(&k1, "mint.example", amount, &signature, &pubkey),
             expected,
             "{name}"
         );
+        if expected {
+            let check = check_note(&k1, "mint.example", amount, &signature, &pubkey)
+                .unwrap_or_else(|| panic!("{name}: a valid certificate"));
+            assert_eq!(check.certificate, CertifiedOver::LegacyHash, "{name}");
+            let h = str_of(case, "noteId");
+            assert_eq!(
+                check_note_certificate(&h, amount, &signature, &pubkey),
+                Some(CertifiedOver::LegacyHash),
+                "{name}: by h"
+            );
+        }
 
         if let Some(message) = case["message"].as_str() {
+            let h = str_of(case, "noteId");
             assert_eq!(
-                note_signature_message(&k1, amount).as_deref(),
-                Some(message),
+                note_signature_message_for_hash(&h, amount),
+                message,
                 "{name}: message"
             );
-            let digest = note_signature_digest(&k1, amount).expect("digest");
             assert_eq!(
-                hex::encode(digest),
+                hex::encode(note_signature_digest_for_hash(&h, amount)),
                 str_of(case, "digest"),
                 "{name}: digest"
             );
+            // a current mint certifies the same note over its Q instead
+            if let Some(id) = note_id_of(&k1) {
+                assert_eq!(
+                    note_signature_message(&k1, amount),
+                    Some(format!("LNURLcash:{amount}:{id}")),
+                    "{name}"
+                );
+                assert_ne!(id, h, "{name}: a bearer note's id is its Q, not h");
+                assert_eq!(
+                    note_signature_digest(&k1, amount).map(hex::encode),
+                    Some(hex::encode(note_signature_digest_for_hash(&id, amount))),
+                    "{name}"
+                );
+            }
         }
     }
 }
@@ -816,19 +854,27 @@ fn legacy_derivation_vectors() {
     }
 }
 
-// ---- LUD-25 Part 2 ----
+// ---- key-path notes ----
 //
 // part2.json pins the reference wallet's address branch, the per-note key
-// tweak, ownership signatures, mint certificates and the four bech32m
-// strings. Every field is graded on every branch and note: a wallet that
-// disagrees with one of them cannot find, spend or check a note that another
-// implementation of the same seed made.
+// tweak, each key's key-path spend for its host's domain, mint certificates
+// and the bech32m strings. Every field is graded on every branch and note: a
+// wallet that disagrees with one of them cannot find, spend or check a note
+// that another implementation of the same seed made.
 
 fn bytes32(value: &Value, key: &str) -> [u8; 32] {
     hex::decode(str_of(value, key))
         .expect("hex")
         .try_into()
         .unwrap_or_else(|_| panic!("{key} is 32 bytes"))
+}
+
+fn bytes_of(value: &Value, key: &str) -> Vec<u8> {
+    hex::decode(str_of(value, key)).unwrap_or_else(|_| panic!("{key} is hex"))
+}
+
+fn u32_of(value: &Value, key: &str) -> u32 {
+    u32::try_from(value[key].as_u64().unwrap_or_else(|| panic!("{key}"))).expect("a u32")
 }
 
 fn index_of(note: &Value) -> u32 {
@@ -866,6 +912,59 @@ fn parity_of(private_key: &[u8; 32]) -> &'static str {
     }
 }
 
+fn x_only_of(secret_key: &[u8; 32]) -> String {
+    let key = SecretKey::from_slice(secret_key).expect("a valid key");
+    hex::encode(
+        key.x_only_public_key(&Secp256k1::signing_only())
+            .0
+            .serialize(),
+    )
+}
+
+/// One key-path note's spend fields, as part2.json and nostr-seed.json both
+/// carry them: the sighash for its domain, the signature, the `ck1`, and what
+/// the SERVICE makes of it there and elsewhere.
+fn grade_key_path_note(note: &Value, secret: &[u8; 32], host: &str, domain: &str, at: &str) {
+    let pubkey = bytes32(note, "notePubkey");
+    assert_eq!(
+        hex::encode(key_path_sighash(&pubkey, domain)),
+        str_of(note, "sighash"),
+        "{at}: sighash"
+    );
+    // Fixed BIP-340 auxiliary input: the same key reproduces the same ck1 for
+    // the same domain byte for byte, for seed recovery. Signing from the host
+    // as stored reduces it to the domain first.
+    let payload = sign_note_ownership(secret, host).expect("signs");
+    assert_eq!(&payload[..32], &pubkey, "{at}");
+    assert_eq!(
+        hex::encode(&payload[32..]),
+        str_of(note, "keyPathSignature"),
+        "{at}"
+    );
+    let ck1 = str_of(note, "ck1");
+    assert_eq!(encode_ck1(&payload), ck1, "{at}");
+    assert_eq!(decode_ck1(&ck1), Some(DecodedCk1::Current(payload)), "{at}");
+
+    // the SERVICE's side: the ck1 names its note, and opens it at its own
+    // domain under the current scheme, and nowhere else
+    let owner = recover_note_ownership_pubkey(&payload, domain).expect("verifies");
+    assert_eq!((owner.pubkey_x_only, owner.legacy), (pubkey, false), "{at}");
+    assert_eq!(note_id_of(&ck1), Some(str_of(note, "notePubkey")), "{at}");
+    assert_eq!(note_lookup_of(&ck1), Some(str_of(note, "cp1")), "{at}");
+    assert_eq!(
+        check_spend(&ck1, domain).map(|check| check.verdict),
+        Some(SpendVerdict::Opens),
+        "{at}"
+    );
+    assert!(
+        matches!(
+            check_spend(&ck1, "elsewhere.example").map(|check| check.verdict),
+            Some(SpendVerdict::Fails(_))
+        ),
+        "{at}: another mint"
+    );
+}
+
 #[test]
 fn part2_branch_vectors() {
     let vectors = load("part2.json");
@@ -879,18 +978,27 @@ fn part2_branch_vectors() {
         Some("m/139'/d1/d2/d3/d4")
     );
     assert_eq!(conventions["hashingKey"].as_str(), Some("m/139'/0"));
-    assert_eq!(conventions["ownershipMessage"].as_str(), Some("LNURLcash"));
     assert_eq!(
         conventions["certificateMessage"].as_str(),
         Some("LNURLcash:<amount_msat>:<hex(pk)>")
     );
-    assert_eq!(note_ownership_message(), b"LNURLcash");
+    assert_eq!(
+        conventions["addressProofMessage"].as_str(),
+        Some("LNURLcash:<register|unregister>:<domain>:<username>")
+    );
+    assert!(
+        conventions.get("ownershipMessage").is_none(),
+        "a ck1 no longer signs a fixed message"
+    );
 
     let branches = vectors["branches"].as_array().expect("branches");
     // An odd branch is the only thing that exercises the negation, and the
     // top of the u32 range is where a hardened-index mistake would show.
     assert!(branches.iter().any(|b| b["branchParity"] == "odd"));
     assert!(branches.iter().any(|b| b["branchParity"] == "even"));
+    // and a host with a port is where the derivation and the spend domain
+    // part company
+    assert!(branches.iter().any(|b| b["host"] != b["domain"]));
     let indices: Vec<u32> = branches[0]["notes"]
         .as_array()
         .expect("notes")
@@ -901,6 +1009,8 @@ fn part2_branch_vectors() {
 
     for branch in branches {
         let host = str_of(branch, "host");
+        let domain = str_of(branch, "domain");
+        assert_eq!(spend_domain_of(&host), Some(domain.clone()), "{host}");
         let seed = hex::decode(str_of(branch, "seedHex")).expect("seedHex is hex");
         assert_eq!(
             bip39_seed(&str_of(branch, "mnemonic")),
@@ -914,7 +1024,8 @@ fn part2_branch_vectors() {
             str_of(branch, "cashRoot"),
             "{host}"
         );
-        // the hashing key is m/139'/0, so the four levels hang off the root itself
+        // the hashing key is m/139'/0, so the four levels hang off the root
+        // itself, derived from the host exactly as stored, port included
         let domain_indices: Vec<u32> = branch["domainIndices"]
             .as_array()
             .expect("domainIndices")
@@ -973,28 +1084,7 @@ fn part2_branch_vectors() {
                 .unwrap_or_else(|err| panic!("{at}: {err}"));
             assert_eq!(hex::encode(secret), str_of(note, "noteSecretKey"), "{at}");
 
-            // Fixed BIP-340 auxiliary input: the same key reproduces the same
-            // ck1 byte for byte for seed recovery.
-            let payload = sign_note_ownership(&secret).expect("signs");
-            assert_eq!(&payload[..32], &pubkey);
-            assert_eq!(
-                hex::encode(&payload[32..]),
-                str_of(note, "ownershipSignature"),
-                "{at}"
-            );
-            let ck1 = str_of(note, "ck1");
-            assert_eq!(encode_ck1(&payload), ck1, "{at}");
-            assert_eq!(decode_ck1(&ck1), Some(DecodedCk1::Current(payload)), "{at}");
-
-            // the SERVICE's side: the ck1 alone gives the key the note is
-            // filed under, which is also the one the watcher derived
-            assert_eq!(
-                recover_note_ownership_pubkey(&payload),
-                Some(pubkey),
-                "{at}"
-            );
-            assert_eq!(note_id_of(&ck1), Some(str_of(note, "notePubkey")), "{at}");
-            assert_eq!(note_lookup_of(&ck1), Some(str_of(note, "cp1")), "{at}");
+            grade_key_path_note(note, &secret, &host, &domain, &at);
         }
     }
 }
@@ -1002,22 +1092,48 @@ fn part2_branch_vectors() {
 #[test]
 fn address_proof_vectors() {
     let vectors = load("part2.json");
-    for proof in vectors["addressProofs"].as_array().expect("addressProofs") {
+    let proofs = vectors["addressProofs"].as_array().expect("addressProofs");
+    assert!(!proofs.is_empty());
+    for proof in proofs {
         let action = str_of(proof, "action");
+        let domain = str_of(proof, "domain");
         let username = str_of(proof, "username");
+        let at = format!("{action} {username}@{domain}");
+        let secret = bytes32(proof, "indexZeroSecretKey");
+        assert_eq!(x_only_of(&secret), str_of(proof, "indexZeroPubkey"), "{at}");
         assert_eq!(
-            address_proof_message(&action, &username).expect("valid action"),
-            str_of(proof, "message")
+            address_proof_message(&action, &domain, &username).expect("valid action"),
+            str_of(proof, "message"),
+            "{at}"
         );
         assert_eq!(
-            hex::encode(
-                sign_address_proof(&bytes32(proof, "indexZeroSecretKey"), &action, &username)
-                    .expect("signs")
-            ),
-            str_of(proof, "signature")
+            hex::encode(address_proof_digest(&action, &domain, &username).expect("digest")),
+            str_of(proof, "digest"),
+            "{at}"
+        );
+        let signature = sign_address_proof(&secret, &action, &domain, &username).expect("signs");
+        assert_eq!(hex::encode(signature), str_of(proof, "signature"), "{at}");
+
+        // what the SERVICE checks: BIP-340 against pk_0, over the digest
+        let verifier = k256::schnorr::VerifyingKey::from_bytes(&bytes32(proof, "indexZeroPubkey"))
+            .expect("a key");
+        let parsed = k256::schnorr::Signature::try_from(&signature[..]).expect("a signature");
+        assert!(verifier
+            .verify_raw(
+                &address_proof_digest(&action, &domain, &username).expect("digest"),
+                &parsed
+            )
+            .is_ok());
+
+        // bound to its domain: the proof for another SERVICE is another proof
+        assert_ne!(
+            sign_address_proof(&secret, &action, "elsewhere.example", &username).expect("signs"),
+            signature,
+            "{at}"
         );
     }
-    assert!(address_proof_message("delete", "alice").is_err());
+    assert!(address_proof_message("delete", "mint.example", "alice").is_err());
+    assert!(address_proof_message("register", "", "alice").is_err());
 }
 
 #[test]
@@ -1034,13 +1150,24 @@ fn part2_certificate_vectors() {
     );
 
     // Every note in the file by key, so each certificate is checked the way a
-    // recipient checks one: from the note's ck1 and nothing else.
-    let ck1_of: HashMap<String, String> = vectors["branches"]
+    // recipient checks one: from the note's ck1 and its domain, nothing else.
+    let ck1_of: HashMap<String, (String, String)> = vectors["branches"]
         .as_array()
         .expect("branches")
         .iter()
-        .flat_map(|branch| branch["notes"].as_array().expect("notes"))
-        .map(|note| (str_of(note, "notePubkey"), str_of(note, "ck1")))
+        .flat_map(|branch| {
+            let domain = str_of(branch, "domain");
+            branch["notes"]
+                .as_array()
+                .expect("notes")
+                .iter()
+                .map(move |note| {
+                    (
+                        str_of(note, "notePubkey"),
+                        (str_of(note, "ck1"), domain.clone()),
+                    )
+                })
+        })
         .collect();
 
     let certificates = vectors["certificates"].as_array().expect("certificates");
@@ -1062,7 +1189,7 @@ fn part2_certificate_vectors() {
             digest,
             "{at}"
         );
-        let ck1 = ck1_of
+        let (ck1, domain) = ck1_of
             .get(&pubkey)
             .unwrap_or_else(|| panic!("{at}: the certificate names a note in the file"));
         assert_eq!(
@@ -1099,8 +1226,9 @@ fn part2_certificate_vectors() {
         assert_eq!(&signature[..64], &compact[..], "{at}");
         assert_eq!(i32::from(signature[64]), recovery.to_i32(), "{at}");
 
-        // Each recovers to the mint's key: by the note's key, in either
-        // spelling of the signature, and from the ck1 alone...
+        // Each recovers to the mint's key: by the note's id, in either
+        // spelling of the signature, by its cp1, and from the ck1 at its
+        // domain...
         assert!(
             verify_note_signature_hash(&pubkey, amount, &signature_hex, &mint_pubkey),
             "{at}"
@@ -1109,27 +1237,63 @@ fn part2_certificate_vectors() {
             verify_note_signature_hash(&pubkey, amount, &cs1, &mint_pubkey),
             "{at}"
         );
-        assert!(
-            verify_note_signature(ck1, amount, &cs1, &mint_pubkey),
+        let cp1 = encode_cp1(&bytes32(certificate, "notePubkey"));
+        assert_eq!(
+            check_note_certificate(&cp1, amount, &cs1, &mint_pubkey),
+            Some(CertifiedOver::OutputKey),
             "{at}"
         );
+        let check = check_note(ck1, domain, amount, &cs1, &mint_pubkey).expect("verifies");
+        assert_eq!(check.certificate, CertifiedOver::OutputKey, "{at}");
+        assert_eq!(check.spend, SpendVerdict::Opens, "{at}");
         assert!(
-            verify_note_signature(ck1, amount, &signature_hex, &mint_pubkey),
+            verify_note_signature(ck1, domain, amount, &signature_hex, &mint_pubkey),
             "{at}"
         );
         // ...and to nothing it does not cover
         assert!(
-            !verify_note_signature(ck1, amount + 1, &cs1, &mint_pubkey),
+            !verify_note_signature(ck1, domain, amount + 1, &cs1, &mint_pubkey),
             "{at}: another amount"
         );
-        let other = ck1_of
+        let (other, other_domain) = ck1_of
             .iter()
             .find(|(key, _)| **key != pubkey)
             .map(|(_, other)| other)
             .expect("another note");
         assert!(
-            !verify_note_signature(other, amount, &cs1, &mint_pubkey),
+            !verify_note_signature(other, other_domain, amount, &cs1, &mint_pubkey),
             "{at}: another note"
+        );
+        // A cs1 whose prefix states another amount than the one it signs
+        // proves nothing, whichever amount is asked about.
+        let relabelled = encode_cs1_with_amount(amount + 1000, &signature);
+        assert!(
+            !verify_note_signature_hash(&pubkey, amount, &relabelled, &mint_pubkey),
+            "{at}: relabelled"
+        );
+        assert!(
+            !verify_note_signature_hash(&pubkey, amount + 1000, &relabelled, &mint_pubkey),
+            "{at}: relabelled"
+        );
+
+        // The certificate is public, and so is Q. A ck1 pairing them with a
+        // signature that does not open the note must not pass as the note,
+        // however good the certificate: it is refused at the note's own
+        // domain, and so is the genuine ck1 at any other.
+        let mut forged = decode_ck1(ck1).expect("a ck1").as_bytes().to_vec();
+        forged[40] ^= 0x01;
+        let forged = encode_ck1(&forged.try_into().expect("96 bytes"));
+        let check = check_note(&forged, domain, amount, &cs1, &mint_pubkey)
+            .expect("the certificate itself is good");
+        assert!(matches!(check.spend, SpendVerdict::Fails(_)), "{at}");
+        assert!(!check.is_verified(), "{at}");
+        assert!(
+            !verify_note_signature(&forged, domain, amount, &cs1, &mint_pubkey),
+            "{at}: forged"
+        );
+        assert!(
+            !verify_note_signature(ck1, "elsewhere.example", amount, &cs1, &mint_pubkey),
+            "{at}: another mint"
         );
     }
 }
@@ -1138,13 +1302,17 @@ fn part2_certificate_vectors() {
 fn part2_string_vectors() {
     let vectors = load("part2.json");
 
-    // the payload as hex, or None, for each of the four types
+    // the payload as hex, or None, for each type
     let decode = |kind: &str, value: &str| -> Option<String> {
         let (decoded, is) = match kind {
             "cp1" => (decode_cp1(value).map(hex::encode), is_cp1(value)),
             "ck1" => (
                 decode_ck1(value).map(|decoded| hex::encode(decoded.as_bytes())),
                 is_ck1(value),
+            ),
+            "cw1" => (
+                decode_cw1(value).map(|cw1| format!("{cw1:?}")),
+                is_cw1(value),
             ),
             "cs1" => (
                 decode_cs1_with_amount(value).map(|cs1| hex::encode(cs1.signature)),
@@ -1191,7 +1359,7 @@ fn part2_string_vectors() {
     }
 }
 
-/// An extension, not LUD-25: a Part 2 branch rooted in a Nostr identity key.
+/// An extension, not LUD-25: a key-path branch rooted in a Nostr identity key.
 #[test]
 fn nostr_seed_vectors() {
     let vectors = load("nostr-seed.json");
@@ -1202,6 +1370,8 @@ fn nostr_seed_vectors() {
     assert!(!cases.is_empty());
     for case in cases {
         let host = str_of(case, "host");
+        let domain = str_of(case, "domain");
+        assert_eq!(spend_domain_of(&host), Some(domain.clone()), "{host}");
         let identity = bytes32(case, "identity");
 
         assert_eq!(
@@ -1210,14 +1380,8 @@ fn nostr_seed_vectors() {
             "{host}"
         );
         // the npub a lightning address on this branch belongs to
-        let identity_key = SecretKey::from_slice(&identity).expect("a valid identity");
         assert_eq!(
-            hex::encode(
-                identity_key
-                    .x_only_public_key(&Secp256k1::signing_only())
-                    .0
-                    .serialize()
-            ),
+            x_only_of(&identity),
             str_of(case, "identityPubkey"),
             "{host}"
         );
@@ -1245,15 +1409,40 @@ fn nostr_seed_vectors() {
                 .unwrap_or_else(|err| panic!("{at}: {err}"));
             assert_eq!(hex::encode(pubkey), str_of(note, "notePubkey"), "{at}");
             assert_eq!(encode_cp1(&pubkey), str_of(note, "cp1"), "{at}");
-            let ck1 = encode_ck1(&sign_note_ownership(&secret).expect("signs"));
-            assert_eq!(ck1, str_of(note, "ck1"), "{at}");
-            assert_eq!(
-                note_id_of(&str_of(note, "ck1")),
-                Some(str_of(note, "notePubkey")),
-                "{at}: ck1 recovery"
-            );
+            grade_key_path_note(note, &secret, &host, &domain, &at);
         }
     }
+}
+
+/// The canonical spend transaction, serialised with its witness, the way
+/// spec vector 3 prints it: nVersion 2, segwit marker and flag, one input
+/// spending (prevout, 0) with an empty scriptSig and the given sequence, one
+/// output of value 0 with an empty scriptPubKey, the witness, and the
+/// locktime. The crate never builds one - nothing is ever broadcast - but a
+/// port can check its sighash against Bitcoin Core's by it.
+fn canonical_spend_transaction(
+    prevout: &[u8; 32],
+    sequence: u32,
+    locktime: u32,
+    witness: &[&[u8]],
+) -> Vec<u8> {
+    let mut tx = Vec::new();
+    tx.extend_from_slice(&2u32.to_le_bytes());
+    tx.extend_from_slice(&[0x00, 0x01, 0x01]);
+    tx.extend_from_slice(prevout);
+    tx.extend_from_slice(&0u32.to_le_bytes());
+    tx.push(0x00);
+    tx.extend_from_slice(&sequence.to_le_bytes());
+    tx.push(0x01);
+    tx.extend_from_slice(&0u64.to_le_bytes());
+    tx.push(0x00);
+    tx.push(u8::try_from(witness.len()).expect("a short witness"));
+    for item in witness {
+        tx.push(u8::try_from(item.len()).expect("a short item"));
+        tx.extend_from_slice(item);
+    }
+    tx.extend_from_slice(&locktime.to_le_bytes());
+    tx
 }
 
 /// LUD-25's own published "Test Vectors" section (25.md), transcribed as
@@ -1323,30 +1512,33 @@ fn spec_vectors() {
             assert_eq!(hex::encode(sk), str_of(note, "sk"), "{at}");
 
             // x(sk_i . G) == pk_i, the round-trip 25.md calls out explicitly
-            let secp = Secp256k1::signing_only();
-            let (xonly, _) = SecretKey::from_slice(&sk)
-                .expect("valid scalar")
-                .x_only_public_key(&secp);
             assert_eq!(
-                hex::encode(xonly.serialize()),
+                x_only_of(&sk),
                 str_of(note, "pk"),
                 "{at}: sk_i.G round-trip"
             );
         }
     }
 
-    // vector 2's LN address registration proofs, signed by sk_0
+    // vector 2's LN address registration proofs, signed by sk_0 and bound to
+    // the vector's own domain
     let v2 = &vectors["vector2"];
     let branch2 = branch_of(v2);
     let sk0 = derive_note_secret_key(&branch2.private_key, &branch2.chain_code, 0).expect("sk_0");
     for proof in v2["addressProofs"].as_array().expect("addressProofs") {
         let action = str_of(proof, "action");
+        let domain = str_of(proof, "domain");
         let username = str_of(proof, "username");
+        assert_eq!(domain, str_of(v2, "domain"));
         assert_eq!(
-            address_proof_message(&action, &username).expect("message"),
+            address_proof_message(&action, &domain, &username).expect("message"),
             str_of(proof, "message")
         );
-        let signature = sign_address_proof(&sk0, &action, &username).expect("signs");
+        assert_eq!(
+            hex::encode(address_proof_digest(&action, &domain, &username).expect("digest")),
+            str_of(proof, "digest")
+        );
+        let signature = sign_address_proof(&sk0, &action, &domain, &username).expect("signs");
         assert_eq!(
             hex::encode(signature),
             str_of(proof, "signature"),
@@ -1354,26 +1546,80 @@ fn spec_vectors() {
         );
     }
 
-    // vector 3: ck1 wallet-side ownership proof, over sk_0/pk_0 from vector 1
+    // vector 3: a key-path spend, every step from domain to signature
     let v3 = &vectors["vector3"];
-    let sk3: [u8; 32] = hex::decode(str_of(v3, "secretKey"))
-        .expect("hex")
-        .try_into()
-        .expect("32 bytes");
-    let ownership = sign_note_ownership(&sk3).expect("signs");
+    let sk3 = bytes32(v3, "secretKey");
+    let q3 = bytes32(v3, "Q");
+    let domain3 = str_of(v3, "domain");
+    assert_eq!(x_only_of(&sk3), str_of(v3, "Q"));
+    assert_eq!(encode_cp1(&q3), str_of(v3, "cp1"));
+    let prevout = spend_prevout(&domain3);
+    assert_eq!(hex::encode(prevout), str_of(v3, "prevoutTxid"));
     assert_eq!(
-        hex::encode(&ownership[32..]),
-        str_of(v3, "ownershipSignature")
+        format!("5120{}", hex::encode(q3)),
+        str_of(v3, "spentScriptPubKey")
     );
-    assert_eq!(encode_ck1(&ownership), str_of(v3, "ck1"));
+    let sig_msg = spend_sig_msg(&q3, &domain3, 0, 0xffff_ffff, None);
+    assert_eq!(hex::encode(&sig_msg), str_of(v3, "sigMsg"));
+    assert_eq!(sig_msg.len(), 174);
+    let fields = &v3["sigMsgFields"];
+    for (name, range) in [
+        ("hash_type", 0..1),
+        ("nVersion", 1..5),
+        ("nLockTime", 5..9),
+        ("sha_prevouts", 9..41),
+        ("sha_amounts", 41..73),
+        ("sha_scriptpubkeys", 73..105),
+        ("sha_sequences", 105..137),
+        ("sha_outputs", 137..169),
+        ("spend_type", 169..170),
+        ("input_index", 170..174),
+    ] {
+        assert_eq!(hex::encode(&sig_msg[range]), str_of(fields, name), "{name}");
+    }
+    let sighash = key_path_sighash(&q3, &domain3);
+    assert_eq!(hex::encode(sighash), str_of(v3, "sighash"));
+    assert_eq!(tagged_hash("TapSighash", &[&[0x00], &sig_msg]), sighash);
+    assert_eq!(str_of(v3, "auxRand"), "00".repeat(32));
+    let payload = sign_note_ownership(&sk3, &domain3).expect("signs");
+    assert_eq!(&payload[..32], &q3);
+    assert_eq!(hex::encode(&payload[32..]), str_of(v3, "signature"));
+    assert_eq!(
+        hex::encode(canonical_spend_transaction(
+            &prevout,
+            0xffff_ffff,
+            0,
+            &[&payload[32..]]
+        )),
+        str_of(v3, "spendTransaction")
+    );
+    let ck1 = str_of(v3, "ck1");
+    assert_eq!(encode_ck1(&payload), ck1);
+    assert_eq!(
+        check_spend(&ck1, &domain3).map(|check| check.verdict),
+        Some(SpendVerdict::Opens)
+    );
+    // "The same ck1 submitted to a SERVICE on any other domain fails"
+    assert!(matches!(
+        check_spend(&ck1, "moneyer.dev").map(|check| check.verdict),
+        Some(SpendVerdict::Fails(_))
+    ));
 
     // vector 4: cs1 mint offline certificate, over pk_0/pk_1 from vector 1
     let v4 = &vectors["vector4"];
-    let mint_key = SecretKey::from_slice(&hex::decode(str_of(v4, "mintPrivateKey")).expect("hex"))
-        .expect("valid mint key");
+    let mint_key = SecretKey::from_slice(&bytes32(v4, "mintPrivateKey")).expect("valid mint key");
     let secp = Secp256k1::new();
     let mint_pubkey = hex::encode(PublicKey::from_secret_key(&secp, &mint_key).serialize());
     assert_eq!(mint_pubkey, str_of(v4, "mintPubkey"));
+    let sign_certificate = |digest: [u8; 32]| -> String {
+        let (recovery, compact) = secp
+            .sign_ecdsa_recoverable(&Message::from_digest(digest), &mint_key)
+            .serialize_compact();
+        let mut signature = [0u8; 65];
+        signature[..64].copy_from_slice(&compact);
+        signature[64] = recovery.to_i32() as u8;
+        hex::encode(signature)
+    };
 
     let pk = str_of(v4, "notePubkey");
     let other_pk = str_of(v4, "otherNotePubkey");
@@ -1389,19 +1635,14 @@ fn spec_vectors() {
         let digest = note_signature_digest_for_hash(&pk, amount);
         assert_eq!(hex::encode(digest), str_of(cert, "digest"), "{at}");
 
-        let (recovery, compact) = secp
-            .sign_ecdsa_recoverable(&Message::from_digest(digest), &mint_key)
-            .serialize_compact();
-        let mut signature = [0u8; 65];
-        signature[..64].copy_from_slice(&compact);
-        signature[64] = recovery.to_i32() as u8;
-        let signature_hex = hex::encode(signature);
+        let signature_hex = sign_certificate(digest);
         assert_eq!(signature_hex, str_of(cert, "signature"), "{at}");
-        assert_eq!(
-            encode_cs1_with_amount(amount, &signature),
-            str_of(cert, "cs1"),
-            "{at}"
-        );
+        let signature: [u8; 65] = hex::decode(&signature_hex)
+            .expect("hex")
+            .try_into()
+            .expect("65 bytes");
+        let cs1 = encode_cs1_with_amount(amount, &signature);
+        assert_eq!(cs1, str_of(cert, "cs1"), "{at}");
 
         assert!(
             verify_note_signature_hash(&pk, amount, &signature_hex, &mint_pubkey),
@@ -1411,5 +1652,494 @@ fn spec_vectors() {
             !verify_note_signature_hash(&other_pk, amount, &signature_hex, &mint_pubkey),
             "{at}: another note"
         );
+        // by its cp1, and from vector 3's ck1 of the same key
+        let cp1 = encode_cp1(&bytes32(v4, "notePubkey"));
+        assert_eq!(
+            check_note_certificate(&cp1, amount, &cs1, &mint_pubkey),
+            Some(CertifiedOver::OutputKey),
+            "{at}"
+        );
+        assert!(
+            verify_note_signature(&ck1, &domain3, amount, &cs1, &mint_pubkey),
+            "{at}"
+        );
+    }
+
+    // vector 5: a bearer note, from preimage to cw1 and its certificate
+    let v5 = &vectors["vector5"];
+    let preimage = str_of(v5, "preimage");
+    let h = bytes32(v5, "h");
+    let q5 = bytes32(v5, "Q");
+    assert_eq!(hash_k1(&preimage).expect("hash"), str_of(v5, "h"));
+    assert_eq!(hex::encode(bearer_leaf(&h)), str_of(v5, "leaf"));
+    assert_eq!(
+        hex::encode(tapleaf_hash(&bearer_leaf(&h), TAPLEAF_VERSION)),
+        str_of(v5, "tapleafHash")
+    );
+    assert_eq!(hex::encode(NUMS_H), str_of(v5, "H"));
+    assert_eq!(
+        hex::encode(tagged_hash(
+            "TapTweak",
+            &[&NUMS_H, &bytes32(v5, "tapleafHash")]
+        )),
+        str_of(v5, "t")
+    );
+    let note = bearer_note(&h).expect("a bearer note");
+    assert_eq!(note.output_key, q5);
+    assert_eq!(hex::encode(note.control_block), str_of(v5, "controlBlock"));
+    let cp1 = str_of(v5, "cp1");
+    assert_eq!(encode_cp1(&q5), cp1);
+    // "The hex h and cp1<Q> name the same note"
+    assert_eq!(decode_note(&str_of(v5, "h")), Some(q5));
+    assert_eq!(decode_note(&cp1), Some(q5));
+    // "the hex preimage and the full cw1 are the same spend"
+    let cw1 = str_of(v5, "cw1");
+    let preimage_bytes = hex::decode(&preimage).expect("hex");
+    assert_eq!(
+        encode_cw1(&bearer_cw1(&preimage_bytes).expect("a cw1")).expect("encodes"),
+        cw1
+    );
+    assert_eq!(note_id_of(&preimage), Some(str_of(v5, "Q")));
+    assert_eq!(note_id_of(&cw1), Some(str_of(v5, "Q")));
+    assert_eq!(note_lookup_of(&preimage), Some(str_of(v5, "h")));
+    assert_eq!(note_lookup_of(&cw1), Some(cp1.clone()));
+    // "and open Q at any domain, since the leaf checks no signature"
+    for domain in ["mint.example", "moneyer.dev"] {
+        for spend in [&preimage, &cw1] {
+            assert_eq!(
+                check_spend(spend, domain),
+                Some(lnurlcash_core::SpendCheck {
+                    output_key: q5,
+                    verdict: SpendVerdict::Opens
+                }),
+                "{spend} at {domain}"
+            );
+        }
+    }
+
+    let mint_pubkey5 = str_of(v5, "mintPubkey");
+    assert_eq!(mint_pubkey5, mint_pubkey, "vector 4's SERVICE key");
+    let cert = &v5["certificate"];
+    let amount = cert["amountMsat"].as_u64().expect("amountMsat");
+    assert_eq!(
+        note_signature_message(&preimage, amount),
+        Some(str_of(cert, "message"))
+    );
+    let digest = note_signature_digest(&preimage, amount).expect("digest");
+    assert_eq!(hex::encode(digest), str_of(cert, "digest"));
+    assert_eq!(sign_certificate(digest), str_of(cert, "signature"));
+    let cs1 = str_of(cert, "cs1");
+    for spend in [&preimage, &cw1] {
+        let check = check_note(spend, "mint.example", amount, &cs1, &mint_pubkey)
+            .unwrap_or_else(|| panic!("{spend}: certified"));
+        assert_eq!(check.output_key, q5);
+        assert_eq!(check.certificate, CertifiedOver::OutputKey);
+        assert!(check.is_verified());
+    }
+    for reference in [str_of(v5, "h"), cp1] {
+        assert_eq!(
+            check_note_certificate(&reference, amount, &cs1, &mint_pubkey),
+            Some(CertifiedOver::OutputKey),
+            "{reference}"
+        );
+    }
+    let url = str_of(v5, "certifiedNoteUrl");
+    assert_eq!(note_declared_amount(&url), Some(amount));
+    let check = check_note_url(&url, &mint_pubkey).expect("a certified note");
+    assert_eq!(
+        (check.output_key, check.certificate, check.is_verified()),
+        (q5, CertifiedOver::OutputKey, true)
+    );
+}
+
+// ---- spends ----
+//
+// spends.json: bearer notes, key-path spends across domains, a script tree,
+// a CHECKSIG leaf's script-path sighash, time claims, leaf rules, malformed
+// cw1s, off-curve cp1s and the short forms. The mint's rules are here too,
+// so a wallet can tell a holder what a mint will do with a note.
+
+#[test]
+fn spends_bearer_vectors() {
+    let vectors = load("spends.json");
+    assert_eq!(str_of(&vectors, "nums"), hex::encode(NUMS_H));
+    let bearers = vectors["bearers"].as_array().expect("bearers");
+    // both parities, so both control-block leading bytes
+    assert!(bearers.iter().any(|b| b["parity"] == 0));
+    assert!(bearers.iter().any(|b| b["parity"] == 1));
+    for bearer in bearers {
+        let name = str_of(bearer, "name");
+        let preimage = str_of(bearer, "preimage");
+        let h = bytes32(bearer, "h");
+        assert_eq!(
+            hash_k1(&preimage).expect("hash"),
+            str_of(bearer, "h"),
+            "{name}"
+        );
+        assert_eq!(
+            hex::encode(bearer_leaf(&h)),
+            str_of(bearer, "leaf"),
+            "{name}"
+        );
+        let leaf_hash = tapleaf_hash(&bearer_leaf(&h), TAPLEAF_VERSION);
+        assert_eq!(
+            hex::encode(leaf_hash),
+            str_of(bearer, "tapleafHash"),
+            "{name}"
+        );
+        assert_eq!(
+            hex::encode(tagged_hash("TapTweak", &[&NUMS_H, &leaf_hash])),
+            str_of(bearer, "tweak"),
+            "{name}"
+        );
+        let tweaked = taproot_tweak(&NUMS_H, &leaf_hash).expect("tweaks");
+        assert_eq!(
+            hex::encode(tweaked.output_key),
+            str_of(bearer, "Q"),
+            "{name}"
+        );
+        assert_eq!(
+            u64::from(tweaked.parity),
+            bearer["parity"].as_u64().expect("parity"),
+            "{name}"
+        );
+        let note = bearer_note(&h).expect("a bearer note");
+        assert_eq!(
+            hex::encode(note.control_block),
+            str_of(bearer, "controlBlock"),
+            "{name}"
+        );
+        assert_eq!(
+            encode_cp1(&note.output_key),
+            str_of(bearer, "cp1"),
+            "{name}"
+        );
+        let cw1 = str_of(bearer, "cw1");
+        assert_eq!(
+            encode_cw1(&bearer_cw1(&hex::decode(&preimage).expect("hex")).expect("a cw1"))
+                .expect("encodes"),
+            cw1,
+            "{name}"
+        );
+        assert_eq!(note_id_of(&cw1), Some(str_of(bearer, "Q")), "{name}");
+        assert_eq!(note_id_of(&preimage), Some(str_of(bearer, "Q")), "{name}");
+    }
+}
+
+#[test]
+fn spends_key_path_vectors() {
+    let vectors = load("spends.json");
+    let key_path = &vectors["keyPath"];
+    let secret = bytes32(key_path, "secretKey");
+    let q = bytes32(key_path, "Q");
+    assert_eq!(x_only_of(&secret), str_of(key_path, "Q"));
+    assert_eq!(encode_cp1(&q), str_of(key_path, "cp1"));
+
+    let mut ck1_at = HashMap::new();
+    for spend in key_path["spends"].as_array().expect("spends") {
+        let domain = str_of(spend, "domain");
+        let normalised = str_of(spend, "normalisedDomain");
+        assert_eq!(
+            spend_domain_of(&domain),
+            Some(normalised.clone()),
+            "{domain}"
+        );
+        assert_eq!(
+            hex::encode(spend_prevout(&normalised)),
+            str_of(spend, "prevoutTxid"),
+            "{domain}"
+        );
+        assert_eq!(
+            hex::encode(key_path_sighash(&q, &normalised)),
+            str_of(spend, "sighash"),
+            "{domain}"
+        );
+        let payload = sign_note_ownership(&secret, &domain).expect("signs");
+        assert_eq!(
+            hex::encode(&payload[32..]),
+            str_of(spend, "signature"),
+            "{domain}"
+        );
+        let ck1 = str_of(spend, "ck1");
+        assert_eq!(encode_ck1(&payload), ck1, "{domain}");
+        assert_eq!(
+            check_spend(&ck1, &domain).map(|check| check.verdict),
+            Some(SpendVerdict::Opens),
+            "{domain}"
+        );
+        ck1_at.insert(normalised, ck1);
+    }
+    let cross = key_path["crossDomain"].as_array().expect("crossDomain");
+    assert!(cross.iter().any(|case| case["valid"] == true));
+    assert!(cross.iter().any(|case| case["valid"] == false));
+    for case in cross {
+        let signed_for = str_of(case, "signedFor");
+        let verified_at = str_of(case, "verifiedAt");
+        let ck1 = &ck1_at[&signed_for];
+        assert_eq!(
+            check_spend(ck1, &verified_at).is_some_and(|check| check.verdict.opens()),
+            case["valid"].as_bool().expect("valid"),
+            "{signed_for} at {verified_at}: {}",
+            str_of(case, "why")
+        );
+    }
+
+    for case in vectors["domains"].as_array().expect("domains") {
+        let url = str_of(case, "url");
+        assert_eq!(spend_domain_of(&url), Some(str_of(case, "domain")), "{url}");
+    }
+}
+
+#[test]
+fn spends_tree_vectors() {
+    let vectors = load("spends.json");
+    let tree = &vectors["tree"];
+    let internal_secret = bytes32(tree, "internalSecretKey");
+    let internal = bytes32(tree, "internalKey");
+    assert_eq!(x_only_of(&internal_secret), str_of(tree, "internalKey"));
+    assert_eq!(
+        str_of(tree, "shape"),
+        "root = branch(branch(leaves[0], leaves[1]), leaves[2])"
+    );
+
+    let leaves = tree["leaves"].as_array().expect("leaves");
+    let hashes: Vec<[u8; 32]> = leaves
+        .iter()
+        .map(|leaf| {
+            let version = u8::try_from(leaf["version"].as_u64().expect("version")).expect("a byte");
+            let hash = tapleaf_hash(&bytes_of(leaf, "script"), version);
+            assert_eq!(hex::encode(hash), str_of(leaf, "tapleafHash"));
+            hash
+        })
+        .collect();
+    let root = tapbranch_hash(&tapbranch_hash(&hashes[0], &hashes[1]), &hashes[2]);
+    assert_eq!(hex::encode(root), str_of(tree, "merkleRoot"));
+    assert_eq!(
+        hex::encode(tagged_hash("TapTweak", &[&internal, &root])),
+        str_of(tree, "tweak")
+    );
+    let tweaked = taproot_tweak(&internal, &root).expect("tweaks");
+    let q = bytes32(tree, "Q");
+    assert_eq!(tweaked.output_key, q);
+    assert_eq!(
+        u64::from(tweaked.parity),
+        tree["parity"].as_u64().expect("parity")
+    );
+    assert_eq!(encode_cp1(&q), str_of(tree, "cp1"));
+
+    for (index, leaf) in leaves.iter().enumerate() {
+        let at = format!("leaf {index}");
+        let script = bytes_of(leaf, "script");
+        let control_block = bytes_of(leaf, "controlBlock");
+        // whatever the leaf version, its control block commits to Q: the
+        // version is policed by the mint, not the fold
+        assert_eq!(output_key_of(&script, &control_block), Some(q), "{at}");
+        let cw1 = Cw1 {
+            locktime: 0,
+            sequence: 0xffff_ffff,
+            script,
+            control_block,
+            witness: leaf["witness"]
+                .as_array()
+                .expect("witness")
+                .iter()
+                .map(|item| hex::decode(item.as_str().expect("hex")).expect("hex"))
+                .collect(),
+        };
+        let encoded = str_of(leaf, "cw1");
+        assert_eq!(encode_cw1(&cw1).expect("encodes"), encoded, "{at}");
+        assert_eq!(decode_cw1(&encoded), Some(cw1), "{at}");
+        assert_eq!(note_id_of(&encoded), Some(str_of(tree, "Q")), "{at}");
+        let verdict = check_spend(&encoded, "mint.example")
+            .expect("a spend")
+            .verdict;
+        match str_of(leaf, "verdict").as_str() {
+            "accept" => assert_eq!(verdict, SpendVerdict::Opens, "{at}"),
+            "reject" => {
+                let reason = str_of(leaf, "reason");
+                assert!(
+                    matches!(&verdict, SpendVerdict::Fails(why) if why.contains(&reason)),
+                    "{at}: {verdict:?}, want {reason}"
+                );
+            }
+            other => panic!("{at}: a verdict this suite does not know: {other}"),
+        }
+    }
+
+    // and by its key path, with the key tweaked by the tree
+    let key_path = &tree["keyPath"];
+    let domain = str_of(key_path, "domain");
+    let tweaked_secret = taproot_tweak_secret_key(&internal_secret, &root).expect("tweaks");
+    assert_eq!(
+        hex::encode(tweaked_secret),
+        str_of(key_path, "tweakedSecretKey")
+    );
+    assert_eq!(
+        hex::encode(key_path_sighash(&q, &domain)),
+        str_of(key_path, "sighash")
+    );
+    let payload = sign_note_ownership(&tweaked_secret, &domain).expect("signs");
+    assert_eq!(&payload[..32], &q);
+    assert_eq!(hex::encode(&payload[32..]), str_of(key_path, "signature"));
+    let ck1 = str_of(key_path, "ck1");
+    assert_eq!(encode_ck1(&payload), ck1);
+    assert_eq!(
+        check_spend(&ck1, &domain).map(|check| check.verdict),
+        Some(SpendVerdict::Opens)
+    );
+}
+
+#[test]
+fn spends_checksig_vectors() {
+    let vectors = load("spends.json");
+    let checksig = &vectors["checksig"];
+    let secret = bytes32(checksig, "secretKey");
+    let pubkey = str_of(checksig, "pubkey");
+    assert_eq!(x_only_of(&secret), pubkey);
+    let leaf = bytes_of(checksig, "leaf");
+    assert_eq!(
+        hex::encode(&leaf),
+        format!("20{pubkey}ac"),
+        "<pk> OP_CHECKSIG"
+    );
+    let control_block = bytes_of(checksig, "controlBlock");
+    let q = bytes32(checksig, "Q");
+    assert_eq!(output_key_of(&leaf, &control_block), Some(q));
+    assert_eq!(encode_cp1(&q), str_of(checksig, "cp1"));
+    let domain = str_of(checksig, "domain");
+    let signer = k256::schnorr::SigningKey::from_bytes(&secret).expect("a key");
+
+    for spend in checksig["spends"].as_array().expect("spends") {
+        let locktime = u32_of(spend, "locktime");
+        let sequence = u32_of(spend, "sequence");
+        let at = format!("locktime {locktime}, sequence {sequence}");
+        let sig_msg = spend_sig_msg(&q, &domain, locktime, sequence, Some(&leaf));
+        assert_eq!(hex::encode(&sig_msg), str_of(spend, "sigMsg"), "{at}");
+        let sighash = script_path_sighash(&q, &domain, &leaf, locktime, sequence);
+        assert_eq!(hex::encode(sighash), str_of(spend, "sighash"), "{at}");
+        // a leaf signature is an ordinary BIP-340 signature over that sighash
+        let signature = bytes_of(spend, "signature");
+        let parsed = k256::schnorr::Signature::try_from(&signature[..]).expect("a signature");
+        assert!(signer.verifying_key().verify_raw(&sighash, &parsed).is_ok());
+        let cw1 = Cw1 {
+            locktime,
+            sequence,
+            script: leaf.clone(),
+            control_block: control_block.clone(),
+            witness: vec![signature],
+        };
+        let encoded = str_of(spend, "cw1");
+        assert_eq!(encode_cw1(&cw1).expect("encodes"), encoded, "{at}");
+        assert_eq!(decode_cw1(&encoded), Some(cw1), "{at}");
+        // Named, and within the leaf rules, but a CHECKSIG leaf is a script
+        // this crate leaves to the mint's interpreter rather than half-runs.
+        assert_eq!(
+            check_spend(&encoded, &domain),
+            Some(lnurlcash_core::SpendCheck {
+                output_key: q,
+                verdict: SpendVerdict::Unevaluated
+            }),
+            "{at}"
+        );
+        match decode_spend(&encoded) {
+            Some(Spend::ScriptPath { cw1, .. }) => {
+                assert_eq!((cw1.locktime, cw1.sequence), (locktime, sequence), "{at}")
+            }
+            other => panic!("{at}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn spends_rule_vectors() {
+    let vectors = load("spends.json");
+
+    let time_claims = vectors["timeClaims"].as_array().expect("timeClaims");
+    assert!(time_claims.len() > 10);
+    for case in time_claims {
+        let name = str_of(case, "name");
+        let problem = check_time_claim(
+            u32_of(case, "locktime"),
+            u32_of(case, "sequence"),
+            case["now"].as_u64().expect("now"),
+            case["lockedAt"].as_u64().expect("lockedAt"),
+        );
+        assert_eq!(
+            problem.is_none(),
+            str_of(case, "verdict") == "accept",
+            "{name}: {problem:?} ({})",
+            str_of(case, "why")
+        );
+    }
+
+    let leaf_policy = vectors["leafPolicy"].as_array().expect("leafPolicy");
+    assert!(leaf_policy.len() > 5);
+    for case in leaf_policy {
+        let name = str_of(case, "name");
+        let version = u8::try_from(case["version"].as_u64().expect("version")).expect("a byte");
+        let problem = check_leaf(version, &bytes_of(case, "script"));
+        assert_eq!(
+            problem.is_none(),
+            str_of(case, "verdict") == "allowed",
+            "{name}: {problem:?} ({})",
+            str_of(case, "why")
+        );
+    }
+
+    let malformed = vectors["malformedCw1"].as_array().expect("malformedCw1");
+    assert!(malformed.len() > 5);
+    for case in malformed {
+        let name = str_of(case, "name");
+        let value = str_of(case, "value");
+        assert_eq!(decode_cw1(&value), None, "{name}");
+        assert!(!is_cw1(&value), "{name}");
+        assert_eq!(decode_spend(&value), None, "{name}");
+        assert_eq!(note_id_of(&value), None, "{name}");
+        assert_eq!(check_spend(&value, "mint.example"), None, "{name}");
+    }
+
+    let invalid = vectors["invalidCp1"].as_array().expect("invalidCp1");
+    assert!(!invalid.is_empty());
+    for case in invalid {
+        let cp1 = str_of(case, "cp1");
+        let why = str_of(case, "why");
+        assert_eq!(decode_cp1(&cp1), None, "{why}");
+        assert!(!is_cp1(&cp1), "{why}");
+        assert_eq!(decode_note(&cp1), None, "{why}");
+        // Never named as an output: a mint that failed to check would burn
+        // the inputs into a note no spend can open.
+        assert_eq!(
+            lnurlcash_core::note::build_note_info_url_by_hash("https://mint.example/w", &cp1),
+            None,
+            "{why}"
+        );
+        assert!(
+            matches!(
+                mint_invoice_request_with_hash("https://mint.example/p/cb", 21_000, &cp1),
+                Err(Error::RequestRefused(_))
+            ),
+            "{why}"
+        );
+        assert!(
+            matches!(
+                rotate_request_with_hash("https://mint.example/w/cb", &"11".repeat(32), &cp1),
+                Err(Error::RequestRefused(_))
+            ),
+            "{why}"
+        );
+    }
+
+    let short_forms = vectors["shortForms"].as_array().expect("shortForms");
+    assert!(!short_forms.is_empty());
+    for case in short_forms {
+        let q = bytes32(case, "Q");
+        let cp1_slot = &case["cp1Slot"];
+        let k1_slot = &case["k1Slot"];
+        assert_eq!(decode_note(&str_of(cp1_slot, "hex")), Some(q));
+        assert_eq!(decode_note(&str_of(cp1_slot, "sameAs")), Some(q));
+        assert_eq!(note_id_of(&str_of(k1_slot, "hex")), Some(hex::encode(q)));
+        assert_eq!(note_id_of(&str_of(k1_slot, "sameAs")), Some(hex::encode(q)));
+        // the 64 hex in each slot means something different: never Q itself
+        assert_ne!(str_of(cp1_slot, "hex"), hex::encode(q));
     }
 }

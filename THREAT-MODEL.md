@@ -11,10 +11,13 @@ optional UniFFI surface sit on top.
 
 ## Assets
 
-**Note secrets (`k1`).** Bearer instruments. Whoever holds one can spend it,
-with no further authentication, from anywhere. Compromise is theft, and it
-is silent and irreversible: the money is gone before the previous holder has
-any way to notice.
+**Spends (`k1`).** Bearer instruments: a bearer note's preimage, a `ck1` or a
+`cw1`. Whoever holds one can spend its note with no further authentication.
+A preimage works at any mint the note exists at; a `ck1` only at the mint
+whose domain it signs for, but anyone who sees it can still spend it there.
+Compromise is theft, and it is silent and irreversible: the money is gone
+before the previous holder has any way to notice. Note secret keys and branch
+nodes are the same asset one step removed.
 
 **Replacement secrets awaiting confirmation.** After a mutation whose outcome
 is unknown, the secrets generated in-process may be the only copies of notes
@@ -41,8 +44,8 @@ signed note can be checked against a key the mint published earlier.
 ## What this library defends against
 
 **A service that keeps a copy of your note.** Rotate, split and merge disclose
-only `sha256(secret)`. The service registers the note under that hash and
-never sees the secret. This is the difference between a bearer note and a
+only `sha256(secret)` or a `cp1`. The service registers the note under the
+taproot output key that names and never sees what spends it. This is the difference between a bearer note and a
 receipt, and it is why a service-generated replacement is refused even when
 offered (`serverGeneratedSecrets` in the mock mint exercises exactly this).
 
@@ -59,17 +62,38 @@ http to loopback or `.onion`. A `data:` URL carrying withdrawRequest JSON
 would otherwise mint a self-contained fake note that verifies against
 nothing.
 
-**A service that inflates a note.** A `cp1` note's certificate commits to the
-amount, and so does the raw Part 1 signature returned by the reference mint
-when it has a signer. A service reporting more than it signed fails
-verification, without the holder contacting anyone. The tolerant default also
-admits a legacy hash output from a no-signer mint; that particular note has no
-offline amount proof. Require signatures, or use a certified `cp1` note, where
-that defence matters.
+**A service that inflates a note.** Every note's certificate, bearer or
+key-path, commits to the amount and to the note's output key `Q`. A service
+reporting more than it certified fails verification, without the holder
+contacting anyone, and so does a `cs1` whose human-readable amount disagrees
+with the amount it signs. A certificate from a mint predating taproot, over a
+bearer note's hash instead of `Q`, is still read and reported as such. The
+tolerant default also admits a bearer output from a no-signer mint; that
+particular note has no offline amount proof. Require signatures, or hold a
+certified note, where that defence matters.
+
+**A forged spend beside a genuine certificate.** `Q` and its certificate are
+both public: a mint hands out `cs1` on a `?p=` lookup to anyone who asks. A
+`ck1` states its `Q` in plain sight, so `ck1<Q || junk>` beside a real `cs1`
+looks certified. Offline verification (`check_note`, `verify_note_signature`,
+`check_note_url`) therefore checks that the spend opens `Q` at the note's
+domain as well as the certificate, and needs the domain to do it. A
+certificate alone proves issuance, never that the spend in hand is good.
+
+**A spend replayed at another mint.** Every signature signs a sighash whose
+prevout is bound to the mint's domain, so a `ck1` one mint has seen fails at
+every other. A bearer preimage checks no signature and is bound to no mint,
+by design: it is the money wherever the note exists.
+
+**A note minted to a key nothing can open.** A `cp1` whose `Q` is not a curve
+point, or an output that is neither a `cp1` nor a bearer hash, is refused
+before any request is sent. At a mint that failed to check, naming one would
+burn the inputs into a note no spend could ever open.
 
 **A service that swaps your note.** The informational GET checks that the
-echoed `k1` is the one queried. A different one means either a non-compliant
-service or a note redeemed by somebody else.
+echoed `k1` names the note queried, by its `Q`, and that a different spend of
+it does not fail at the queried domain. Another note means either a
+non-compliant service or a note redeemed by somebody else.
 
 **A secret leaking through a query string.** `sig` is stripped before the
 informational GET, since the service already knows what it signed.
@@ -115,6 +139,15 @@ learns your IP, your timing, and which notes move together. Notes are bearer
 instruments, not private ones — merging several notes tells the mint they
 had one holder. Route over Tor if that matters.
 
+**A timelock is the mint's clock.** A script-path note's time claim is
+judged by the mint against its own clock. `check_time_claim` reports what a
+mint will say, but a timelock a mint honours is a custodial policy, not a
+consensus guarantee, and nothing here presents it as trustless.
+
+**Scripts this library does not run.** Offline, only the bearer hashlock is
+evaluated. Any other leaf is reported `Unevaluated`, never guessed at, and
+`verify_note_signature` treats it as unverified.
+
 **Anything about the sats themselves.** No custody, no channel management,
 no payment routing.
 
@@ -124,6 +157,12 @@ no payment routing.
 `r || s || recovery_id`; lnurl-mint once emitted the reverse. Trying both is
 not a weakening: recovering under the wrong ordering yields an unrelated
 pubkey, which cannot match the expected one.
+
+**Deprecated schemes are read, never produced.** Three older `ck1` shapes
+(Schnorr over the fixed message `LNURLcash` or its sha256, and 65-byte
+recoverable ECDSA) and certificates over a bearer note's hash still verify,
+because notes held under them are money. Each is reported as legacy so a
+holder can rotate; nothing here signs one.
 
 **Errors are typed by whether the request could have been processed**, not by
 transport detail. That distinction is the whole safety model, and message

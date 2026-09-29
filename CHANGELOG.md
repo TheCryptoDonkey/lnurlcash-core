@@ -3,7 +3,159 @@
 Semantic versioning. While the LUD-25 draft is unmerged, `0.x` minor bumps may
 carry breaking changes; pin an exact version.
 
-## Unreleased
+## 0.2.0 - unreleased
+
+Breaking. Follows LUD-25's unified taproot model (lnurl/luds `6e865b1`,
+"unified taproot verification") and grades against `lnurlcash-conformance`
+0.14.0. The two `ck1` changes further down never reached a release and are
+superseded here: a `ck1` now signs a domain-bound sighash, not a fixed
+message.
+
+### Every note is a taproot output key
+
+Every note is a BIP-341 output key `Q`, named `cp1<Q>`, and a mint stores,
+burns and certifies it by `hex(Q)`. A spend opens it by its key path (`ck1`)
+or a leaf of its script tree (`cw1`). A bearer note is the one-leaf hashlock
+`OP_SHA256 <h> OP_EQUAL` under BIP-341's NUMS key; its 64-hex preimage and
+its hash are its short forms, so the bearer wire is unchanged and only its id
+moves, from `sha256(k1)` to `hex(Q)`. Every signature signs the BIP-341
+sighash of one canonical, never-broadcast transaction whose prevout is bound
+to the mint's domain (its lowercase hostname, no scheme, no port).
+
+New module `spend`, with no Bitcoin library, since the transaction's shape
+never changes:
+
+- `tagged_hash`, `tapleaf_hash`, `tapbranch_hash`, `taproot_tweak` (to
+  `TaprootTweak { output_key, parity }`), `taproot_tweak_secret_key`,
+  `output_key_of(script, control_block)` (merkle fold, tweak, parity check)
+  and `is_x_only_point`.
+- `bearer_leaf`, `bearer_note(h) -> Option<BearerNote { output_key,
+  control_block, leaf }>`, `bearer_cw1(preimage)`, and the constants
+  `NUMS_H`, `TAPLEAF_VERSION`, `KEY_PATH_LOCKTIME`, `KEY_PATH_SEQUENCE`.
+- `spend_domain_of(url or host)`, `spend_prevout`, `spend_sig_msg`,
+  `key_path_sighash` and `script_path_sighash` (a `SIGHASH_DEFAULT` leaf
+  signature). Spec vector 3 is graded field by field, down to the serialised
+  spend transaction.
+- `decode_note` (a `cp1` or a bearer `h`, to `Q`), `decode_spend` (to
+  `Spend::{KeyPath, LegacyKeyPath, ScriptPath}`) and `check_spend(k1, domain)
+  -> Option<SpendCheck { output_key, verdict }>`, with
+  `SpendVerdict::{Opens, OpensLegacy, Unevaluated, Fails(reason)}`. The bearer
+  hashlock is evaluated; any other script is reported unevaluated rather than
+  half-run. Time claims are left to the mint's clock.
+- The mint's rules, so a wallet can tell a holder what a mint will do:
+  `check_leaf` (leaf version `0xc0`, no `OP_SUCCESSx` outside pushed data) and
+  `check_time_claim`.
+
+`recoverable`:
+
+- `cw1`: `Cw1 { locktime, sequence, script, control_block, witness }`,
+  `encode_cw1` (refuses an item over 65535 bytes), `decode_cw1`, `is_cw1` and
+  `Cw1::output_key`. A payload its length prefixes do not consume exactly,
+  one without a script and control block, and one whose control block commits
+  to no key are all refused.
+- `decode_cp1` and `is_cp1` refuse a `cp1` whose `Q` is not the x coordinate
+  of a curve point: no spend could open it.
+- `sign_note_ownership(sk, domain)`: BIP-340 over `key_path_sighash(Q,
+  domain)` with an all-zero auxiliary input, so one key has one `ck1` per mint.
+  `domain` may be a note URL, a mint URL or a bare host.
+- `recover_note_ownership_pubkey(payload, domain) -> Option<NoteOwner {
+  pubkey_x_only, legacy }>`. The domain-bound sighash is tried first, then the
+  three older schemes (Schnorr over `sha256("LNURLcash")`, over the raw 9
+  bytes, and the 65-byte recoverable ECDSA), reported `legacy: true`. Nothing
+  here signs those any more; reference mints still accept them.
+- `note_id_of(k1)` is `hex(Q)` for every spend: a preimage, a `ck1`, a `cw1`
+  or a legacy `ck1`. It names the note without verifying the spend, since a
+  `ck1` states its `Q` and checking one needs the domain.
+- `note_lookup_of` returns a bearer note's hash for a preimage, and `cp1<Q>`
+  for a `ck1` or `cw1`.
+- `note_ownership_message` is removed.
+
+`signature`:
+
+- Certificates are over `hex(Q)` for every note, bearer notes included.
+  `check_note_certificate(reference, amount, sig, mint_pubkey) ->
+  Option<CertifiedOver>` takes a `cp1` or a bearer `h`; for `h` it also reads
+  a pre-taproot certificate over `h` itself, reported
+  `CertifiedOver::LegacyHash`.
+- `check_note(k1, domain, amount, sig, mint_pubkey) -> Option<NoteCheck {
+  output_key, spend, certificate }>` is LUD-25's offline verification: the
+  spend must open `Q` at the domain, and the certificate must cover `Q` and
+  the amount. `verify_note_signature` gains `domain` (second) and is now
+  `check_note(..)` with `NoteCheck::is_verified()`. It had to change: `Q` and
+  its certificate are both public, so without a domain `ck1<Q || junk>`
+  beside a real `cs1` would have passed.
+- `verify_note_signature_hash(id, ..)` stays the raw check over exactly the id
+  given. An amount-bearing `cs1` must now also state, in its human-readable
+  part, the amount it signs: a payload moved under another amount's prefix no
+  longer verifies.
+- Address proofs sign `sha256("LNURLcash:<action>:<domain>:<username>")`:
+  `address_proof_message`, `address_proof_digest` and `sign_address_proof`
+  gain `domain`, before `username`, reduced to its hostname.
+
+`note`:
+
+- `check_note_url(url, mint_pubkey)`: `check_note` read off a certified note
+  URL, its domain, spend, certificate and declared amount included.
+- `build_note_info_url_by_hash` sends every lookup as `?p=`, a bearer `h`
+  included, and refuses an off-curve `cp1`.
+
+`protocol` and `errors`:
+
+- Every output goes as `p1`/`p2`, a bearer note's hash included; `h`/`h2` are
+  no longer sent. Every mint that reads `p1` reads a hash there. The
+  `*_request_with_hash` builders refuse, before sending, an output that is
+  neither a `cp1` whose key is a point nor 64 hex: at a mint that did not
+  check, it would burn the inputs into a note nothing can open.
+- `parse_note_info` compares an echoed `k1` by the note it names, and refuses
+  another spend of that note which fails at the queried URL's domain.
+  `WithdrawRequestInfo` and `NoteInfoByHash` gain `signature`, the `sig` LUD-25
+  now has the informational GET return, as sent and unverified.
+- `Error::is_output_in_use()` and `errors::OUTPUT_IN_USE`: the `already in
+  use` refusal of a `p1`/`p2` naming a note already outstanding or burned.
+  Nothing was burned; retry at the next index. Matched as a phrase, so
+  lnurl-mint's `Output already in use.` counts too.
+- A note tweak `t >= n` is reduced mod n, as LUD-25 requires and
+  lnurl-wallet does, instead of refusing the index. A ~2^-128 event.
+- The policy is unchanged, and stricter than the spec's SHOULD: a `cp1`
+  output is still owed its `cs1` whatever the policy says, and a bearer output
+  only under `require_signatures`.
+
+Over the FFI (for lnurlcash-kotlin to follow):
+
+- Changed signatures: `sign_note_ownership(secret_key_hex, domain)`,
+  `sign_address_proof(index_zero_secret_key_hex, action, domain, username)`,
+  `verify_note_signature(k1, domain, amount_msat, signature, mint_pubkey_hex)`,
+  and `recover_note_ownership_pubkey(signature_hex, domain)`, which now
+  returns `FfiNoteOwner { pubkey_x_only, legacy }`.
+- Changed meaning, same signature: `note_id_of` (`hex(Q)`), `note_lookup_of`,
+  `hash_k1` (a bearer note's hash, not its id), `decode_cp1`/`is_cp1`
+  (on-curve only), `verify_note_signature_hash` (the amount check),
+  `build_note_info_url_by_hash` (`?p=` always), and the `*_request_with_hash`
+  builders (`p1`/`p2` always, and refusing an output naming no note).
+- `FfiWithdrawInfo` gains `signature`.
+- New records and enums: `FfiNoteOwner`, `FfiNoteCheck { output_key, spend,
+  certificate, verified }`, `FfiSpendCheck { output_key, verdict }`,
+  `FfiSpendVerdict::{Opens, OpensLegacy, Unevaluated, Fails { reason }}`,
+  `FfiCertifiedOver::{OutputKey, LegacyHash}`, `FfiCw1`, `FfiBearerNote`,
+  `FfiTaprootTweak`, `FfiNoteInfoByHash`.
+- New functions: `check_note`, `check_note_url`, `check_note_certificate`,
+  `check_spend`, `spend_domain_of`, `decode_note`, `is_x_only_point`,
+  `key_path_sighash`, `script_path_sighash`, `tapleaf_hash`, `tapbranch_hash`,
+  `taproot_tweak`, `taproot_tweak_secret_key`, `output_key_of`, `bearer_note`,
+  `bearer_cw1`, `encode_cw1`, `decode_cw1`, `is_cw1`, `check_leaf`,
+  `check_time_claim` and `parse_note_info_by_hash`. `key_path_sighash` and
+  `script_path_sighash` take the exact domain string; everything else taking
+  a domain accepts a URL or host.
+
+Graded against `lnurlcash-conformance` 0.14.0: spec vectors 1 to 5, every
+section of `spends.json`, and `part2.json` and `nostr-seed.json` with their
+domain-bound `sighash` and `keyPathSignature`. `signature.json` still certifies
+over `h` and is read through the legacy path. Against the mock mint: a
+key-path note spent by a `ck1` bound to its host, the same key's `ck1` for
+another domain refused, a bearer note's full `cw1` spending it like its
+preimage, `?p=` lookups by `h` and by `cp1` with their certificates, `already
+in use`, and a pre-taproot certificate over `h` read as legacy. CI pins
+conformance `v0.14.0`.
 
 Docs: README, llms.txt and doc comments now describe the literal `m/139'/d1/d2/d3/d4` address branch, the sha256-digest ownership and address proofs, and no Part 1 secret ladder.
 

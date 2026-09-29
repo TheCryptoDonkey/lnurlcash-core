@@ -20,21 +20,24 @@
 //!    you saved in step 1 may be the only copy of the money
 
 use crate::errors::Error;
-use crate::{bolt11, cash, errors, fees, note, protocol, recoverable, secrets, signature, urls};
+use crate::{
+    bolt11, cash, errors, fees, note, protocol, recoverable, secrets, signature, spend, urls,
+};
 
 /// One GET, and the secrets whose loss would destroy money.
 #[derive(Debug, uniffi::Record)]
 pub struct FfiRequest {
     pub url: String,
-    /// Fresh secrets this request disclosed the hashes of. Persist these
+    /// Fresh preimages this request disclosed the hashes of. Persist these
     /// BEFORE performing the GET: if the answer is lost, they may be the only
     /// copies of notes the service has already minted.
     pub new_secrets: Vec<String>,
     /// The outputs a rotate, split or merge named, exactly as sent:
     /// `[output]` for a rotate or merge, `[output, change]` for a split, and
     /// empty for every other request. Hand them to [`parse_mutation`] with
-    /// the response: a `cp1` output is owed a certificate and a hash output is
-    /// not, and this is how the parser knows which it asked for. Not secret.
+    /// the response: a `cp1` output is owed a certificate whatever the
+    /// policy, and this is how the parser knows which it asked for. Not
+    /// secret.
     pub outputs: Vec<String>,
 }
 
@@ -53,14 +56,13 @@ impl From<protocol::Request> for FfiRequest {
 /// change something.
 #[derive(Debug, Clone, Copy, uniffi::Record)]
 pub struct FfiPolicy {
-    /// Demand the raw Part 1 signature over a legacy hash output, matching the
-    /// committed reference wallet. Off by default to admit a reference mint
-    /// running without a signer. A `cp1` output is owed its `cs1` certificate
-    /// whatever this says.
+    /// Demand a certificate for a bearer output named by its hash too. Off by
+    /// default to admit a mint running without a signer. A `cp1` output is
+    /// owed its `cs1` certificate whatever this says.
     #[uniffi(default = false)]
     pub require_signatures: bool,
     /// Refuse a withdrawRequest that publishes no valid `mintPubkey`. On by
-    /// default; off only for a Part 1-only service that publishes none.
+    /// default; off only for a service that publishes none.
     #[uniffi(default = true)]
     pub require_mint_pubkey: bool,
 }
@@ -119,9 +121,8 @@ pub enum LnurlcashError {
     },
 
     /// The mutation LANDED and the SERVICE returned no certificate for a
-    /// `cp1` output, which LUD-25 Part 2 requires - or no signature over a
-    /// hash output when the policy asked for one. A non-conforming SERVICE,
-    /// but the note exists, and `new_secrets` is the only key to it. Persist
+    /// `cp1` output - or none for a bearer output when the policy asked for
+    /// one. The note exists, and `new_secrets` is the only key to it. Persist
     /// them before deciding anything else. Empty when the caller named the
     /// output: this library never saw what stands behind it.
     Unverifiable {
@@ -211,6 +212,23 @@ pub struct FfiWithdrawInfo {
     pub min_withdrawable: u64,
     pub default_description: Option<String>,
     pub mint_pubkey: Option<String>,
+    /// `sig`: the service's `cs1` for the queried note, as sent and
+    /// unverified. Check it with [`check_note`].
+    pub signature: Option<String>,
+}
+
+/// What a `?p=` lookup returns: the same, with no `k1`, since the request
+/// named the note without its spend.
+#[derive(Debug, uniffi::Record)]
+pub struct FfiNoteInfoByHash {
+    pub callback: String,
+    pub max_withdrawable: u64,
+    pub min_withdrawable: u64,
+    pub default_description: Option<String>,
+    pub mint_pubkey: Option<String>,
+    /// `sig`, as sent and unverified. Check it with
+    /// [`check_note_certificate`] against what was looked up.
+    pub signature: Option<String>,
 }
 
 #[derive(Debug, uniffi::Record)]
@@ -296,9 +314,8 @@ impl From<FfiMutationKind> for protocol::MutationKind {
 
 #[derive(Debug, uniffi::Record)]
 pub struct FfiMutation {
-    /// Always present for a `cp1` output: its `cs1` certificate. For a plain
-    /// hash output null, unless the service still issues the old Part 1
-    /// signature over the hash.
+    /// The `cs1` for the first output. Always present for a `cp1` output; for
+    /// a bearer output named by its hash, null from a mint with no signer.
     pub signature: Option<String>,
     /// The same for a split's change.
     pub change_signature: Option<String>,
@@ -315,7 +332,9 @@ pub fn generate_note_secret() -> String {
     secrets::generate_note_secret()
 }
 
-/// A note's id: sha256 of the secret, which is the `h` disclosed on a mutation.
+/// A bearer note's hash `h = sha256(preimage)`: its `cp1` short form, what a
+/// mutation discloses as `p1`/`p2`. Not the note's id, which is `hex(Q)`
+/// (see [`note_id_of`]).
 #[uniffi::export]
 pub fn hash_k1(k1: &str) -> FfiResult<String> {
     secrets::hash_k1(k1).map_err(Into::into)
@@ -326,30 +345,357 @@ pub fn is_preimage(value: &str) -> bool {
     secrets::is_preimage(value)
 }
 
-/// Verify a note's signature against the mint's pubkey, offline. Accepts the
-/// recovery id at either end, because implementations disagree about which.
+/// Which message a certificate verified over.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum FfiCertifiedOver {
+    /// `hex(Q)`, LUD-25's certificate for any note.
+    OutputKey,
+    /// A bearer note's hash, as a mint signed before notes were keyed by `Q`.
+    LegacyHash,
+}
+
+impl From<signature::CertifiedOver> for FfiCertifiedOver {
+    fn from(over: signature::CertifiedOver) -> Self {
+        match over {
+            signature::CertifiedOver::OutputKey => FfiCertifiedOver::OutputKey,
+            signature::CertifiedOver::LegacyHash => FfiCertifiedOver::LegacyHash,
+        }
+    }
+}
+
+/// Whether a spend opens its note.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum FfiSpendVerdict {
+    /// Under LUD-25's current rules.
+    Opens,
+    /// Only under a deprecated `ck1` scheme a mint still accepts: rotate it.
+    OpensLegacy,
+    /// A script path whose script this library does not evaluate. The mint
+    /// decides.
+    Unevaluated,
+    /// It does not open the note.
+    Fails { reason: String },
+}
+
+impl From<spend::SpendVerdict> for FfiSpendVerdict {
+    fn from(verdict: spend::SpendVerdict) -> Self {
+        match verdict {
+            spend::SpendVerdict::Opens => FfiSpendVerdict::Opens,
+            spend::SpendVerdict::OpensLegacy => FfiSpendVerdict::OpensLegacy,
+            spend::SpendVerdict::Unevaluated => FfiSpendVerdict::Unevaluated,
+            spend::SpendVerdict::Fails(reason) => FfiSpendVerdict::Fails { reason },
+        }
+    }
+}
+
+/// A spend's note, `hex(Q)`, and whether the spend opens it.
+#[derive(Debug, uniffi::Record)]
+pub struct FfiSpendCheck {
+    pub output_key: String,
+    pub verdict: FfiSpendVerdict,
+}
+
+/// What an offline check of a certified note found.
+#[derive(Debug, uniffi::Record)]
+pub struct FfiNoteCheck {
+    /// The note, `hex(Q)`.
+    pub output_key: String,
+    pub spend: FfiSpendVerdict,
+    pub certificate: FfiCertifiedOver,
+    /// Certified, and opened by the spend under a scheme mints accept.
+    pub verified: bool,
+}
+
+impl From<signature::NoteCheck> for FfiNoteCheck {
+    fn from(check: signature::NoteCheck) -> Self {
+        FfiNoteCheck {
+            output_key: hex::encode(check.output_key),
+            verified: check.is_verified(),
+            spend: check.spend.into(),
+            certificate: check.certificate.into(),
+        }
+    }
+}
+
+/// LUD-25's offline verification as a yes or no: the certificate covers the
+/// note `k1` spends at `amount_msat`, recovering to `mint_pubkey_hex`, and
+/// the spend opens the note at `domain` (the note URL, or its host). Accepts
+/// the recovery id at either end, because implementations disagree.
 ///
-/// `k1` may be a Part 2 `ck1`, and `signature_hex` a Part 2 `cs1`.
+/// `k1` is a 64-hex preimage, a `ck1` or a `cw1`; `signature` a `cs1` or 65
+/// bytes of hex.
 #[uniffi::export]
 pub fn verify_note_signature(
     k1: &str,
+    domain: &str,
     amount_msat: u64,
-    signature_hex: &str,
+    signature: &str,
     mint_pubkey_hex: &str,
 ) -> bool {
-    signature::verify_note_signature(k1, amount_msat, signature_hex, mint_pubkey_hex)
+    signature::verify_note_signature(k1, domain, amount_msat, signature, mint_pubkey_hex)
 }
 
-/// The same check by the note's id - a hash, or a Part 2 note's public key as
-/// hex - for a caller that holds the id but not the k1 that spends it.
+/// The same check, reporting which certificate message verified and what the
+/// spend did. Null when `k1` is no spend or the certificate does not verify.
+#[uniffi::export]
+pub fn check_note(
+    k1: &str,
+    domain: &str,
+    amount_msat: u64,
+    signature: &str,
+    mint_pubkey_hex: &str,
+) -> Option<FfiNoteCheck> {
+    signature::check_note(k1, domain, amount_msat, signature, mint_pubkey_hex).map(Into::into)
+}
+
+/// [`check_note`] from a certified note URL, `...?k1=<spend>&sig=<cs1>`, with
+/// the domain, spend, certificate and declared amount all read off it.
+#[uniffi::export]
+pub fn check_note_url(url: &str, mint_pubkey_hex: &str) -> Option<FfiNoteCheck> {
+    note::check_note_url(url, mint_pubkey_hex).map(Into::into)
+}
+
+/// A certificate for a note named without its spend: a `cp1`, or a bearer
+/// note's 64-hex hash, which is also checked against the pre-taproot message
+/// over the hash. Null if neither verifies.
+#[uniffi::export]
+pub fn check_note_certificate(
+    reference: &str,
+    amount_msat: u64,
+    signature: &str,
+    mint_pubkey_hex: &str,
+) -> Option<FfiCertifiedOver> {
+    signature::check_note_certificate(reference, amount_msat, signature, mint_pubkey_hex)
+        .map(Into::into)
+}
+
+/// The raw certificate check over exactly the 64-hex id given: `hex(Q)`, or a
+/// bearer note's hash for a pre-taproot certificate. Prefer [`check_note`] or
+/// [`check_note_certificate`], which work the id out themselves.
 #[uniffi::export]
 pub fn verify_note_signature_hash(
-    h: &str,
+    id: &str,
     amount_msat: u64,
     signature_hex: &str,
     mint_pubkey_hex: &str,
 ) -> bool {
-    signature::verify_note_signature_hash(h, amount_msat, signature_hex, mint_pubkey_hex)
+    signature::verify_note_signature_hash(id, amount_msat, signature_hex, mint_pubkey_hex)
+}
+
+// ---- spends ----
+//
+// Every note is a taproot output key `Q`. Keys, scripts and control blocks
+// cross as hex; a domain is a note URL, a mint URL or a bare host except
+// where it is marked as the exact string.
+
+/// The domain a spend at `value` (a note or mint URL, or a bare host) is
+/// bound to: its lowercase hostname, never the scheme or port.
+#[uniffi::export]
+pub fn spend_domain_of(value: &str) -> Option<String> {
+    spend::spend_domain_of(value)
+}
+
+/// Does the spend in `k1` open its note at `domain`, as the mint would
+/// judge it? Null if `k1` is no spend. Time claims are the mint's to judge.
+#[uniffi::export]
+pub fn check_spend(k1: &str, domain: &str) -> Option<FfiSpendCheck> {
+    spend::check_spend(k1, domain).map(|check| FfiSpendCheck {
+        output_key: hex::encode(check.output_key),
+        verdict: check.verdict.into(),
+    })
+}
+
+/// `hex(Q)` of what goes where a `cp1` goes: a `cp1` whose key is a point, or
+/// a bearer note's 64-hex hash.
+#[uniffi::export]
+pub fn decode_note(value: &str) -> Option<String> {
+    spend::decode_note(value).map(hex::encode)
+}
+
+#[uniffi::export]
+pub fn is_x_only_point(value_hex: &str) -> bool {
+    hex::decode(value_hex.trim()).is_ok_and(|bytes| spend::is_x_only_point(&bytes))
+}
+
+/// What a `ck1`'s signature signs: the key-path sighash for `Q` at the exact
+/// `domain` string given (lowercased), as hex.
+#[uniffi::export]
+pub fn key_path_sighash(output_key_hex: &str, domain: &str) -> FfiResult<String> {
+    Ok(hex::encode(spend::key_path_sighash(
+        &hex_array(output_key_hex, "an output key")?,
+        domain,
+    )))
+}
+
+/// What a `SIGHASH_DEFAULT` signature in a `cw1`'s leaf signs, at the exact
+/// `domain` string given (lowercased), for the time the spend claims.
+#[uniffi::export]
+pub fn script_path_sighash(
+    output_key_hex: &str,
+    domain: &str,
+    leaf_script_hex: &str,
+    locktime: u32,
+    sequence: u32,
+) -> FfiResult<String> {
+    let leaf = hex::decode(leaf_script_hex.trim())
+        .map_err(|_| errors::Error::Protocol("a leaf script must be hex".into()))?;
+    Ok(hex::encode(spend::script_path_sighash(
+        &hex_array(output_key_hex, "an output key")?,
+        domain,
+        &leaf,
+        locktime,
+        sequence,
+    )))
+}
+
+#[uniffi::export]
+pub fn tapleaf_hash(script_hex: &str, leaf_version: u8) -> FfiResult<String> {
+    let script = hex::decode(script_hex.trim())
+        .map_err(|_| errors::Error::Protocol("a leaf script must be hex".into()))?;
+    Ok(hex::encode(spend::tapleaf_hash(&script, leaf_version)))
+}
+
+#[uniffi::export]
+pub fn tapbranch_hash(a_hex: &str, b_hex: &str) -> FfiResult<String> {
+    Ok(hex::encode(spend::tapbranch_hash(
+        &hex_array(a_hex, "a tree node")?,
+        &hex_array(b_hex, "a tree node")?,
+    )))
+}
+
+/// A tweaked output key and its parity, 0 or 1.
+#[derive(Debug, uniffi::Record)]
+pub struct FfiTaprootTweak {
+    pub output_key: String,
+    pub parity: u8,
+}
+
+/// `Q` for an internal key and a script tree's merkle root.
+#[uniffi::export]
+pub fn taproot_tweak(internal_key_hex: &str, merkle_root_hex: &str) -> FfiResult<FfiTaprootTweak> {
+    let tweaked = spend::taproot_tweak(
+        &hex_array(internal_key_hex, "an internal key")?,
+        &hex_array(merkle_root_hex, "a merkle root")?,
+    )
+    .ok_or_else(|| errors::Error::Protocol("that key and tree tweak to no usable key".into()))?;
+    Ok(FfiTaprootTweak {
+        output_key: hex::encode(tweaked.output_key),
+        parity: tweaked.parity,
+    })
+}
+
+/// The secret key that signs for [`taproot_tweak`]'s `Q`. Bearer material.
+#[uniffi::export]
+pub fn taproot_tweak_secret_key(secret_key_hex: &str, merkle_root_hex: &str) -> FfiResult<String> {
+    Ok(hex::encode(spend::taproot_tweak_secret_key(
+        &hex_array(secret_key_hex, "an internal secret key")?,
+        &hex_array(merkle_root_hex, "a merkle root")?,
+    )?))
+}
+
+/// The `Q` a leaf and its control block commit to. Null for a control block
+/// that commits to none.
+#[uniffi::export]
+pub fn output_key_of(script_hex: &str, control_block_hex: &str) -> Option<String> {
+    let script = hex::decode(script_hex.trim()).ok()?;
+    let control_block = hex::decode(control_block_hex.trim()).ok()?;
+    spend::output_key_of(&script, &control_block).map(hex::encode)
+}
+
+/// A bearer note, as hex.
+#[derive(Debug, uniffi::Record)]
+pub struct FfiBearerNote {
+    pub output_key: String,
+    pub control_block: String,
+    pub leaf: String,
+}
+
+/// The bearer note a 32-byte hash `h` names.
+#[uniffi::export]
+pub fn bearer_note(h_hex: &str) -> FfiResult<FfiBearerNote> {
+    let note = spend::bearer_note(&hex_array(h_hex, "a bearer note hash")?)
+        .ok_or_else(|| errors::Error::Protocol("that hash tweaks to no usable key".into()))?;
+    Ok(FfiBearerNote {
+        output_key: hex::encode(note.output_key),
+        control_block: hex::encode(note.control_block),
+        leaf: hex::encode(note.leaf),
+    })
+}
+
+/// A bearer note's full `cw1` for this preimage: the spend its 64-hex short
+/// form stands for. Bearer material.
+#[uniffi::export]
+pub fn bearer_cw1(preimage_hex: &str) -> FfiResult<String> {
+    let preimage = hex::decode(preimage_hex.trim())
+        .map_err(|_| errors::Error::Protocol("a preimage must be hex".into()))?;
+    let cw1 = spend::bearer_cw1(&preimage)
+        .ok_or_else(|| errors::Error::Protocol("that preimage tweaks to no usable key".into()))?;
+    Ok(recoverable::encode_cw1(&cw1)?)
+}
+
+/// A script-path spend, every byte string as hex.
+#[derive(Debug, uniffi::Record)]
+pub struct FfiCw1 {
+    pub locktime: u32,
+    pub sequence: u32,
+    pub script: String,
+    pub control_block: String,
+    /// Bottom of the stack first.
+    pub witness: Vec<String>,
+}
+
+#[uniffi::export]
+pub fn encode_cw1(cw1: FfiCw1) -> FfiResult<String> {
+    let bytes = |value: &str, what: &str| {
+        hex::decode(value.trim())
+            .map_err(|_| errors::Error::Protocol(format!("{what} must be hex")))
+    };
+    Ok(recoverable::encode_cw1(&recoverable::Cw1 {
+        locktime: cw1.locktime,
+        sequence: cw1.sequence,
+        script: bytes(&cw1.script, "a leaf script")?,
+        control_block: bytes(&cw1.control_block, "a control block")?,
+        witness: cw1
+            .witness
+            .iter()
+            .map(|item| bytes(item, "a witness item"))
+            .collect::<Result<_, _>>()?,
+    })?)
+}
+
+/// Null unless the payload parses exactly and its control block commits to
+/// a key.
+#[uniffi::export]
+pub fn decode_cw1(value: &str) -> Option<FfiCw1> {
+    recoverable::decode_cw1(value).map(|cw1| FfiCw1 {
+        locktime: cw1.locktime,
+        sequence: cw1.sequence,
+        script: hex::encode(cw1.script),
+        control_block: hex::encode(cw1.control_block),
+        witness: cw1.witness.iter().map(hex::encode).collect(),
+    })
+}
+
+#[uniffi::export]
+pub fn is_cw1(value: &str) -> bool {
+    recoverable::is_cw1(value)
+}
+
+/// Why a mint refuses this leaf (an unknown leaf version, or an `OP_SUCCESS`
+/// opcode outside pushed data), or null if it does not.
+#[uniffi::export]
+pub fn check_leaf(leaf_version: u8, script_hex: &str) -> FfiResult<Option<String>> {
+    let script = hex::decode(script_hex.trim())
+        .map_err(|_| errors::Error::Protocol("a leaf script must be hex".into()))?;
+    Ok(spend::check_leaf(leaf_version, &script).map(str::to_string))
+}
+
+/// Whether a script path's time claim is due by a mint's clock, in Unix
+/// seconds: null if it is, or why not. `locked_at` is when the mint credited
+/// the note.
+#[uniffi::export]
+pub fn check_time_claim(locktime: u32, sequence: u32, now: u64, locked_at: u64) -> Option<String> {
+    spend::check_time_claim(locktime, sequence, now, locked_at)
 }
 
 // ---- seed-recoverable note secrets ----
@@ -370,8 +716,8 @@ pub fn derive_cash_root(seed_hex: &str) -> FfiResult<String> {
 
 /// `m/139'/d1/d2/d3/d4` for one mint, as a 64-byte hex node.
 ///
-/// The same node [`derive_cash_address_node`] returns: Part 2's note keys hang
-/// off it. Whoever derives it can derive every note key held at that mint, so
+/// The same node [`derive_cash_address_node`] returns: key-path note keys
+/// hang off it. Whoever derives it can derive every note key held at that mint, so
 /// it is provisioning material - one mint's subtree, not the wallet.
 #[uniffi::export]
 pub fn derive_cash_domain_node(root_hex: &str, host: &str) -> FfiResult<String> {
@@ -429,10 +775,10 @@ pub fn derive_note_secret(root_hex: &str, host: &str, index: u32) -> FfiResult<S
     Ok(secrets::derive_note_secret(&root, host, index))
 }
 
-// ---- LUD-25 Part 2: notes keyed by a public key ----
+// ---- key-path notes and the bech32m strings ----
 //
-// Raw bytes cross as hex, as everywhere else here, and the four bech32m
-// strings as themselves. A note secret key, a `ck1`, an address node and a
+// Raw bytes cross as hex, as everywhere else here, and the bech32m strings as
+// themselves. A note secret key, a `ck1`, a `cw1`, an address node and a
 // Nostr cash seed are all bearer material: store them the way the notes are
 // stored, and never log them. A `cx1` spends nothing, but links every note on
 // its branch.
@@ -478,7 +824,7 @@ impl From<recoverable::Cs1> for FfiCs1 {
     }
 }
 
-/// A note's 32-byte x-only public key as a `cp1`.
+/// A note's 32-byte output key `Q` as a `cp1`.
 #[uniffi::export]
 pub fn encode_cp1(pubkey_x_only_hex: &str) -> FfiResult<String> {
     Ok(recoverable::encode_cp1(&hex_array(
@@ -487,6 +833,7 @@ pub fn encode_cp1(pubkey_x_only_hex: &str) -> FfiResult<String> {
     )?))
 }
 
+/// Null for a `cp1` whose key is not a curve point: no spend opens it.
 #[uniffi::export]
 pub fn decode_cp1(value: &str) -> Option<String> {
     recoverable::decode_cp1(value).map(hex::encode)
@@ -497,7 +844,7 @@ pub fn is_cp1(value: &str) -> bool {
     recoverable::is_cp1(value)
 }
 
-/// A 96-byte pubkey-plus-Schnorr-signature payload as a `ck1`.
+/// A 96-byte `Q || sig` key-path spend as a `ck1`.
 #[uniffi::export]
 pub fn encode_ck1(signature_hex: &str) -> FfiResult<String> {
     Ok(recoverable::encode_ck1(&hex_array(
@@ -613,46 +960,66 @@ pub fn derive_note_secret_key(
     )?))
 }
 
-/// The raw 96-byte pubkey-plus-Schnorr-signature payload, as hex. [`encode_ck1`] it for the
-/// wire; either way, it spends the note.
+/// The raw 96-byte `Q || sig` key-path spend of the note `x(sk·G)` at
+/// `domain` (a note URL, a mint URL or a bare host), as hex. [`encode_ck1`]
+/// it for the wire; either way, it spends the note, at that mint only.
 #[uniffi::export]
-pub fn sign_note_ownership(secret_key_hex: &str) -> FfiResult<String> {
-    Ok(hex::encode(recoverable::sign_note_ownership(&hex_array(
-        secret_key_hex,
-        "a note secret key",
-    )?)?))
+pub fn sign_note_ownership(secret_key_hex: &str, domain: &str) -> FfiResult<String> {
+    Ok(hex::encode(recoverable::sign_note_ownership(
+        &hex_array(secret_key_hex, "a note secret key")?,
+        domain,
+    )?))
 }
 
-/// A register/update or unregister proof by the branch's index-0 key, as raw
-/// 64-byte BIP-340 Schnorr signature hex.
+/// A register or unregister proof by the branch's index-0 key, bound to the
+/// service's `domain`, as raw 64-byte BIP-340 Schnorr signature hex.
 #[uniffi::export]
 pub fn sign_address_proof(
     index_zero_secret_key_hex: &str,
     action: &str,
+    domain: &str,
     username: &str,
 ) -> FfiResult<String> {
     Ok(hex::encode(signature::sign_address_proof(
         &hex_array(index_zero_secret_key_hex, "an index-zero secret key")?,
         action,
+        domain,
         username,
     )?))
 }
 
-#[uniffi::export]
-pub fn recover_note_ownership_pubkey(signature_hex: &str) -> Option<String> {
-    let signature = hex::decode(signature_hex.trim()).ok()?;
-    recoverable::recover_note_ownership_pubkey(&signature).map(hex::encode)
+/// A verified `ck1` payload's note key, and whether it was signed under a
+/// deprecated scheme.
+#[derive(Debug, uniffi::Record)]
+pub struct FfiNoteOwner {
+    pub pubkey_x_only: String,
+    /// Signed over a fixed message, or the 65-byte recoverable shape: still
+    /// spendable, but rotate it.
+    pub legacy: bool,
 }
 
-/// The id a SERVICE files a note under: sha256(k1) for a secret, the
-/// verified embedded key for a `ck1`. Compare notes by this, never by k1.
+/// Verify a raw `ck1` payload (96 or 65 bytes of hex) against the mint at
+/// `domain`. Null for an invalid proof, or one signed for another mint.
+#[uniffi::export]
+pub fn recover_note_ownership_pubkey(signature_hex: &str, domain: &str) -> Option<FfiNoteOwner> {
+    let signature = hex::decode(signature_hex.trim()).ok()?;
+    recoverable::recover_note_ownership_pubkey(&signature, domain).map(|owner| FfiNoteOwner {
+        pubkey_x_only: hex::encode(owner.pubkey_x_only),
+        legacy: owner.legacy,
+    })
+}
+
+/// The id a SERVICE files a note under, `hex(Q)`, for any spend: a 64-hex
+/// preimage, a `ck1` or a `cw1`. Names the note without saying the spend
+/// opens it (see [`check_spend`]). Compare notes by this, never by k1.
 #[uniffi::export]
 pub fn note_id_of(k1: &str) -> Option<String> {
     recoverable::note_id_of(k1)
 }
 
-/// What to look a note up by without disclosing it: the hash, or the `cp1`
-/// for a `ck1`. Pass it to [`build_note_info_url_by_hash`].
+/// What to look a note up by without disclosing it: a bearer note's hash for
+/// a preimage, the `cp1` for any other spend. Pass it to
+/// [`build_note_info_url_by_hash`].
 #[uniffi::export]
 pub fn note_lookup_of(k1: &str) -> Option<String> {
     recoverable::note_lookup_of(k1)
@@ -697,9 +1064,9 @@ pub fn derive_nostr_address_node(secret_key_hex: &str, host: &str) -> FfiResult<
 
 // ---- urls and notes ----
 
-/// The informational GET for a note named by its hash rather than its secret,
-/// so nothing spendable goes on the wire. What a restore walk uses. `h` may be
-/// a Part 2 `cp1`, sent as `p`.
+/// The informational GET for a note named by `?p=` rather than its spend, so
+/// nothing spendable goes on the wire. What a restore walk uses. `h` is a
+/// `cp1` or a bearer note's 64-hex hash.
 #[uniffi::export]
 pub fn build_note_info_url_by_hash(withdraw_link: &str, h: &str) -> Option<String> {
     note::build_note_info_url_by_hash(withdraw_link, h)
@@ -839,8 +1206,8 @@ pub fn invoice_request(pay_callback: &str, amount_msat: u64) -> FfiResult<FfiReq
     Ok(protocol::invoice_request(pay_callback, amount_msat)?.into())
 }
 
-/// Ask for a mint invoice, naming the note it will credit with
-/// `h = sha256(secret)`, or with a Part 2 `cp1`, sent as the comment alone.
+/// Ask for a mint invoice, naming the note it will credit by a bearer note's
+/// hash `h = sha256(preimage)`, or by a `cp1`, sent as the comment alone.
 #[uniffi::export]
 pub fn mint_invoice_request_with_hash(
     pay_callback: &str,
@@ -894,16 +1261,17 @@ pub fn merge_request(callback: &str, k1s: Vec<String>, new_secret: &str) -> FfiR
     Ok(protocol::merge_request(callback, &k1s, new_secret)?.into())
 }
 
-/// Rotate into an output the caller already holds: a hash, or a Part 2 `cp1`
-/// (sent as `p1`). The request carries no secrets, because this crate never
-/// saw one - persist whatever stands behind `h` BEFORE the GET.
+/// Rotate into an output the caller already holds: a `cp1`, or a bearer
+/// note's hash, sent as `p1`. The request carries no secrets, because this
+/// crate never saw one - persist whatever stands behind `h` BEFORE the GET.
+/// Refused before sending unless `h` names a note.
 #[uniffi::export]
 pub fn rotate_request_with_hash(callback: &str, k1: &str, h: &str) -> FfiResult<FfiRequest> {
     Ok(protocol::rotate_request_with_hash(callback, k1, h)?.into())
 }
 
-/// As [`rotate_request_with_hash`], for a split: `h` and `h2` each go as a
-/// hash (`h`/`h2`) or a `cp1` (`p1`/`p2`).
+/// As [`rotate_request_with_hash`], for a split: `h` goes as `p1` and `h2`
+/// as `p2`, each a `cp1` or a bearer note's hash.
 #[uniffi::export]
 pub fn split_request_with_hash(
     callback: &str,
@@ -924,9 +1292,8 @@ pub fn merge_request_with_hash(callback: &str, k1s: Vec<String>, h: &str) -> Ffi
 // ---- response parsing ----
 
 /// Only `policy.require_mint_pubkey` matters here. Leave it on unless the
-/// service is a Part 1-only mint that publishes no `mintPubkey`, because a
-/// note with no key to check it against is one whoever receives it must take
-/// on faith.
+/// service publishes no `mintPubkey`, because a note with no key to check it
+/// against is one whoever receives it must take on faith.
 #[uniffi::export]
 pub fn parse_note_info(
     body: &str,
@@ -942,6 +1309,22 @@ pub fn parse_note_info(
         min_withdrawable: info.min_withdrawable,
         default_description: info.default_description,
         mint_pubkey: info.mint_pubkey,
+        signature: info.signature,
+    })
+}
+
+/// The answer to a `?p=` lookup from [`build_note_info_url_by_hash`].
+#[uniffi::export]
+pub fn parse_note_info_by_hash(body: &str, policy: FfiPolicy) -> FfiResult<FfiNoteInfoByHash> {
+    let value = parse_body(body)?;
+    let info = protocol::parse_note_info_by_hash(&value, policy.into())?;
+    Ok(FfiNoteInfoByHash {
+        callback: info.callback,
+        max_withdrawable: info.max_withdrawable,
+        min_withdrawable: info.min_withdrawable,
+        default_description: info.default_description,
+        mint_pubkey: info.mint_pubkey,
+        signature: info.signature,
     })
 }
 
@@ -1020,10 +1403,10 @@ pub fn parse_verify(body: &str) -> FfiResult<FfiVerify> {
 ///
 /// Pass the request's `outputs` too. A `cp1` output that comes back without
 /// its certificate is [`LnurlcashError::Unverifiable`] whatever the policy
-/// says; a plain hash output comes back with its signature null, unless
-/// `policy.require_signatures` asks for one. An output missing from
-/// `outputs` is read as a hash, so leaving them out quietly drops the `cp1`
-/// check.
+/// says; a bearer output named by its hash may come back with its signature
+/// null, unless `policy.require_signatures` asks for one. An output missing
+/// from `outputs` is read as a hash, so leaving them out quietly drops the
+/// `cp1` check.
 #[uniffi::export]
 pub fn parse_mutation(
     body: &str,
