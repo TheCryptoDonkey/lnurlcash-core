@@ -23,8 +23,10 @@ or reading its secret.
 
 ## Release
 
-1. Set the version in `Cargo.toml`, update `Cargo.lock`, and date the matching
-   changelog entry.
+1. Date the matching changelog entry. The version is not in the repository:
+   `Cargo.toml` carries a `0.0.0` placeholder, and the release workflow stamps
+   the tag's version into `Cargo.toml` and `Cargo.lock` before it tests and
+   publishes.
 2. Merge only after CI and the local package dry-run pass.
 3. Create and push the exact version tag, for example `v0.1.0`.
 4. The tag runs the same validation and then enters the protected `crates-io`

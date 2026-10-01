@@ -1,6 +1,7 @@
 [package]
 name = "lnurlcash-core"
-version = "0.2.0"
+# placeholder: release.yml stamps the version from the git tag at publish time
+version = "0.0.0"
 edition = "2021"
 rust-version = "1.75"
 description = "LNURLcash (LUD-25) bearer notes - the money-critical logic, with bindings for other languages"
