@@ -36,7 +36,7 @@
 //! same host: see [`crate::recoverable::derive_cash_address_node`].
 
 use hmac::{Hmac, Mac};
-use secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
+use secp256k1::{PublicKey, Scalar, SecretKey};
 use sha2::{Sha256, Sha512};
 
 use crate::errors::{Error, Result};
@@ -92,8 +92,7 @@ fn hmac512(key: &[u8], data: &[u8]) -> [u8; 64] {
 /// test vectors rather than taking the derivation on trust, and so a host
 /// provisioning a hardware signer can walk the intermediate levels.
 pub fn derive_cash_child(node: &CashNode, index: u32) -> Result<CashNode> {
-    let secp = Secp256k1::signing_only();
-    let parent = SecretKey::from_slice(&node.private_key)
+    let parent = SecretKey::from_secret_bytes(node.private_key)
         .map_err(|_| Error::Protocol("cash node holds an invalid private key".into()))?;
 
     let mut data = [0u8; 37];
@@ -103,7 +102,7 @@ pub fn derive_cash_child(node: &CashNode, index: u32) -> Result<CashNode> {
         // over the same length and can never collide.
         data[1..33].copy_from_slice(&node.private_key);
     } else {
-        data[..33].copy_from_slice(&PublicKey::from_secret_key(&secp, &parent).serialize());
+        data[..33].copy_from_slice(&PublicKey::from_secret_key(&parent).serialize());
     }
     data[33..].copy_from_slice(&index.to_be_bytes());
 
@@ -124,7 +123,7 @@ pub fn derive_cash_child(node: &CashNode, index: u32) -> Result<CashNode> {
     let mut chain_code = [0u8; 32];
     chain_code.copy_from_slice(&material[32..]);
     Ok(CashNode {
-        private_key: child.secret_bytes(),
+        private_key: child.to_secret_bytes(),
         chain_code,
     })
 }
@@ -142,7 +141,7 @@ pub fn derive_cash_master(seed: &[u8]) -> Result<CashNode> {
     let material = hmac512(b"Bitcoin seed", seed);
     let mut private_key = [0u8; 32];
     private_key.copy_from_slice(&material[..32]);
-    SecretKey::from_slice(&private_key).map_err(|_| {
+    SecretKey::from_secret_bytes(private_key).map_err(|_| {
         Error::Protocol("this seed does not produce a valid BIP-32 master key".into())
     })?;
     let mut chain_code = [0u8; 32];
@@ -234,7 +233,7 @@ pub fn cash_node_from_hex(value: &str) -> Result<CashNode> {
     }
     let mut private_key = [0u8; 32];
     private_key.copy_from_slice(&bytes[..32]);
-    SecretKey::from_slice(&private_key)
+    SecretKey::from_secret_bytes(private_key)
         .map_err(|_| Error::Protocol("that cash node holds an invalid private key".into()))?;
     let mut chain_code = [0u8; 32];
     chain_code.copy_from_slice(&bytes[32..]);

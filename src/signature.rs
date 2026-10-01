@@ -26,7 +26,7 @@
 
 use k256::schnorr::SigningKey;
 use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
-use secp256k1::{Message, Secp256k1};
+use secp256k1::Message;
 use sha2::{Digest, Sha256};
 
 use crate::recoverable::{decode_cs1, decode_cs1_with_amount, note_id_of};
@@ -174,20 +174,18 @@ pub fn verify_note_signature_hash(
     }
     let message = Message::from_digest(note_signature_digest_for_hash(id, amount_msat));
     let target = mint_pubkey_hex.trim().to_ascii_lowercase();
-    let secp = Secp256k1::verification_only();
-
     // (compact 64 bytes, recovery id) under each candidate ordering
     let trailing = (&signature[..64], signature[64]);
     let leading = (&signature[1..65], signature[0]);
 
     for (compact, recovery) in [trailing, leading] {
-        let Ok(id) = RecoveryId::from_i32(recovery as i32) else {
+        let Ok(id) = RecoveryId::try_from(i32::from(recovery)) else {
             continue;
         };
         let Ok(sig) = RecoverableSignature::from_compact(compact, id) else {
             continue;
         };
-        if let Ok(recovered) = secp.recover_ecdsa(&message, &sig) {
+        if let Ok(recovered) = sig.recover_ecdsa(message) {
             if hex::encode(recovered.serialize()) == target {
                 return true;
             }

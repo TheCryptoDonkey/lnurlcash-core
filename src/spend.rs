@@ -34,7 +34,7 @@
 //! [`taproot_tweak_secret_key`] takes: every other key, leaf and control
 //! block is public, so none of it needs to be constant-time.
 
-use secp256k1::{Keypair, Parity, Scalar, Secp256k1, XOnlyPublicKey};
+use secp256k1::{Keypair, Parity, Scalar, XOnlyPublicKey};
 use sha2::{Digest, Sha256};
 
 use crate::errors::{Error, Result};
@@ -128,7 +128,7 @@ pub fn tapbranch_hash(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 /// is not can never be opened by any spend, so a mint must refuse one, and a
 /// wallet must never name one as an output.
 pub fn is_x_only_point(x: &[u8]) -> bool {
-    XOnlyPublicKey::from_slice(x).is_ok()
+    <[u8; 32]>::try_from(x).is_ok_and(|x| XOnlyPublicKey::from_byte_array(x).is_ok())
 }
 
 /// A tweaked output key and its parity (0 even, 1 odd), which a control
@@ -149,13 +149,11 @@ fn tweak_scalar(internal_key: &[u8; 32], merkle_root: &[u8; 32]) -> Option<Scala
 /// `None` when `P` is not a point, or the tweak lands on or above the curve
 /// order (a ~2^-128 event BIP-341 also refuses).
 pub fn taproot_tweak(internal_key: &[u8; 32], merkle_root: &[u8; 32]) -> Option<TaprootTweak> {
-    let internal = XOnlyPublicKey::from_slice(internal_key).ok()?;
+    let internal = XOnlyPublicKey::from_byte_array(*internal_key).ok()?;
     let tweak = tweak_scalar(internal_key, merkle_root)?;
-    let (output, parity) = internal
-        .add_tweak(&Secp256k1::verification_only(), &tweak)
-        .ok()?;
+    let (output, parity) = internal.add_tweak(&tweak).ok()?;
     Some(TaprootTweak {
-        output_key: output.serialize(),
+        output_key: output.to_byte_array(),
         parity: match parity {
             Parity::Even => 0,
             Parity::Odd => 1,
@@ -167,18 +165,15 @@ pub fn taproot_tweak(internal_key: &[u8; 32], merkle_root: &[u8; 32]) -> Option<
 /// key's. A key-path spend of a note with a script tree signs with this.
 /// Bearer material.
 pub fn taproot_tweak_secret_key(secret_key: &[u8; 32], merkle_root: &[u8; 32]) -> Result<[u8; 32]> {
-    let secp = Secp256k1::new();
-    let keypair = Keypair::from_seckey_slice(&secp, secret_key).map_err(|_| {
+    let keypair = Keypair::from_secret_bytes(*secret_key).map_err(|_| {
         Error::Protocol("an internal secret key is a 32-byte scalar in [1, n)".into())
     })?;
     let unusable = || Error::Protocol("this tree does not tweak to a usable key".into());
-    let tweak = tweak_scalar(&keypair.x_only_public_key().0.serialize(), merkle_root)
+    let tweak = tweak_scalar(&keypair.x_only_public_key().0.to_byte_array(), merkle_root)
         .ok_or_else(unusable)?;
     // negates an odd-y internal key first, as BIP-341's signer does
-    let tweaked = keypair
-        .add_xonly_tweak(&secp, &tweak)
-        .map_err(|_| unusable())?;
-    Ok(tweaked.secret_bytes())
+    let tweaked = keypair.add_xonly_tweak(&tweak).map_err(|_| unusable())?;
+    Ok(tweaked.to_secret_bytes())
 }
 
 /// The `Q` a leaf and its control block commit to: fold the merkle path with
