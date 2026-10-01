@@ -22,15 +22,15 @@
 //! The names and semantics follow the TypeScript kit, which follows
 //! lnurl-wallet's `src/lib`.
 
-use bech32::{FromBase32, ToBase32, Variant};
 use hmac::{Hmac, Mac};
 use k256::schnorr::{Signature as SchnorrSignature, SigningKey, VerifyingKey};
 use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
-use secp256k1::{Keypair, Message, Scalar, Secp256k1, SecretKey, XOnlyPublicKey};
+use secp256k1::{Keypair, Message, Scalar, SecretKey, XOnlyPublicKey};
 use sha2::{Digest, Sha256};
 
 use crate::cash::{derive_cash_domain_node, derive_cash_root, CashNode};
 use crate::errors::{Error, Result};
+use crate::long_bech32::{self, Bech32m};
 use crate::secrets::is_preimage;
 use crate::signature::lightning_signed_digest;
 use crate::spend::{
@@ -42,7 +42,7 @@ type HmacSha256 = Hmac<Sha256>;
 // ---- bech32m ----
 //
 // `ck1`, `cw1`, `cs1` and `cx1` all run past BIP-173's 90 characters, which
-// the draft deliberately does not adopt, and bech32 0.9 enforces none.
+// the draft deliberately does not adopt, and [`long_bech32`] enforces none.
 // BIP-350's own rules do apply, as lnurl-mint applies them: one case
 // throughout (all uppercase is the same string, mixed case is refused), a
 // bech32m checksum rather than a bech32 one, and zero padding bits. Every
@@ -52,8 +52,7 @@ type HmacSha256 = Hmac<Sha256>;
 const MAX_BECH32_CHARS: usize = 8192;
 
 fn encode_bytes(hrp: &str, bytes: &[u8]) -> String {
-    bech32::encode(hrp, bytes.to_base32(), Variant::Bech32m)
-        .expect("a fixed, valid human-readable part")
+    long_bech32::encode::<Bech32m>(hrp, bytes).expect("a fixed, valid human-readable part")
 }
 
 /// Never panics: anything that is not this type is a `None`.
@@ -62,12 +61,9 @@ fn decode_bytes(hrp: &str, value: &str) -> Option<Vec<u8>> {
     if value.len() > MAX_BECH32_CHARS {
         return None;
     }
-    let (prefix, words, variant) = bech32::decode(value).ok()?;
-    if prefix != hrp || variant != Variant::Bech32m {
-        return None;
-    }
-    // non-zero padding bits, or a whole spare group of them, fail here
-    Vec::<u8>::from_base32(&words).ok()
+    // a bech32 checksum, non-zero padding bits, or a whole spare group of
+    // them, fail here
+    long_bech32::decode::<Bech32m>(hrp, value)
 }
 
 fn decode_fixed<const N: usize>(hrp: &str, value: &str) -> Option<[u8; N]> {
@@ -414,15 +410,12 @@ pub fn derive_note_pubkey(
     purpose: u32,
     index: u32,
 ) -> Result<[u8; 32]> {
-    let secp = Secp256k1::verification_only();
-    let branch = XOnlyPublicKey::from_slice(branch_pubkey_x_only)
+    let branch = XOnlyPublicKey::from_byte_array(*branch_pubkey_x_only)
         .map_err(|_| Error::Protocol("a branch key is not an x-only secp256k1 point".into()))?;
     let tweak = tweak_for(branch_pubkey_x_only, chain_code, purpose, index)?;
     // lift_x(P) + t*G, refusing the point at infinity
-    let (note, _parity) = branch
-        .add_tweak(&secp, &tweak)
-        .map_err(|_| unusable(index))?;
-    Ok(note.serialize())
+    let (note, _parity) = branch.add_tweak(&tweak).map_err(|_| unusable(index))?;
+    Ok(note.to_byte_array())
 }
 
 /// The holder's half: the secret key behind [`derive_note_pubkey`].
@@ -437,16 +430,15 @@ pub fn derive_note_secret_key(
     purpose: u32,
     index: u32,
 ) -> Result<[u8; 32]> {
-    let secp = Secp256k1::new();
-    let branch = Keypair::from_seckey_slice(&secp, branch_private_key).map_err(|_| {
+    let branch = Keypair::from_secret_bytes(*branch_private_key).map_err(|_| {
         Error::Protocol("a branch private key is a 32-byte scalar in [1, n)".into())
     })?;
     let (branch_x, _parity) = branch.x_only_public_key();
-    let tweak = tweak_for(&branch_x.serialize(), chain_code, purpose, index)?;
+    let tweak = tweak_for(&branch_x.to_byte_array(), chain_code, purpose, index)?;
     let note = branch
-        .add_xonly_tweak(&secp, &tweak)
+        .add_xonly_tweak(&tweak)
         .map_err(|_| unusable(index))?;
-    Ok(note.secret_bytes())
+    Ok(note.to_secret_bytes())
 }
 
 // ---- key-path spends ----
@@ -512,15 +504,14 @@ pub struct NoteOwner {
 /// check: any signature recovers to some key.
 pub(crate) fn legacy_ck1_key(signature: &[u8]) -> Option<[u8; 32]> {
     let signature: &[u8; 65] = signature.try_into().ok()?;
-    let recovery = RecoveryId::from_i32(i32::from(signature[64])).ok()?;
+    let recovery = RecoveryId::try_from(i32::from(signature[64])).ok()?;
     let signature = RecoverableSignature::from_compact(&signature[..64], recovery).ok()?;
-    let key = Secp256k1::verification_only()
-        .recover_ecdsa(
-            &Message::from_digest(lightning_signed_digest(LEGACY_OWNERSHIP_MESSAGE)),
-            &signature,
-        )
+    let key = signature
+        .recover_ecdsa(Message::from_digest(lightning_signed_digest(
+            LEGACY_OWNERSHIP_MESSAGE,
+        )))
         .ok()?;
-    Some(key.x_only_public_key().0.serialize())
+    Some(key.x_only_public_key().0.to_byte_array())
 }
 
 /// Verify a `ck1` payload against the mint at `domain` (a note URL, a mint
@@ -610,12 +601,11 @@ pub fn derive_cash_address_node(root: &CashNode, host: &str) -> Result<CashNode>
 
 /// The watch-only half of a branch node.
 pub fn cash_node_to_cx1(node: &CashNode) -> Result<Cx1> {
-    let secp = Secp256k1::signing_only();
-    let key = SecretKey::from_slice(&node.private_key)
+    let key = SecretKey::from_secret_bytes(node.private_key)
         .map_err(|_| Error::Protocol("cash node holds an invalid private key".into()))?;
-    let (pubkey, _parity) = key.x_only_public_key(&secp);
+    let (pubkey, _parity) = key.x_only_public_key();
     Ok(Cx1 {
-        pubkey_x_only: pubkey.serialize(),
+        pubkey_x_only: pubkey.to_byte_array(),
         chain_code: node.chain_code,
     })
 }
@@ -659,13 +649,19 @@ mod tests {
     use super::*;
     use crate::cash::cash_node_to_hex;
     use crate::spend::bearer_cw1;
+    use bech32::primitives::decode::CheckedHrpstring;
+    use bech32::{Checksum, Fe32, Fe32IterExt, Hrp};
 
     const SEED: [u8; 32] = [0x42; 32];
     const DOMAIN: &str = "mint.example";
 
-    fn words_of(value: &str) -> (String, Vec<bech32::u5>) {
-        let (hrp, words, _) = bech32::decode(value).expect("a valid string");
-        (hrp, words)
+    fn words_of(value: &str) -> (Hrp, Vec<Fe32>) {
+        let checked = CheckedHrpstring::new::<Bech32m>(value).expect("a valid string");
+        (checked.hrp(), checked.fe32_iter().collect())
+    }
+
+    fn encode_words<Ck: Checksum>(hrp: &Hrp, words: Vec<Fe32>) -> String {
+        words.into_iter().with_checksum::<Ck>(hrp).chars().collect()
     }
 
     fn samples() -> [(&'static str, String); 5] {
@@ -719,8 +715,8 @@ mod tests {
     #[test]
     fn a_bech32_checksum_is_not_a_bech32m_one() {
         for (hrp, value) in samples() {
-            let (_, words) = words_of(&value);
-            let classic = bech32::encode(hrp, words, Variant::Bech32).expect("encodes");
+            let (prefix, words) = words_of(&value);
+            let classic = encode_words::<long_bech32::Bech32>(&prefix, words);
             assert!(!decodes(hrp, &classic), "{hrp}");
         }
     }
@@ -734,15 +730,15 @@ mod tests {
             if hrp == "cs" {
                 continue;
             }
-            let (_, mut words) = words_of(&value);
+            let (prefix, mut words) = words_of(&value);
             let last = words.len() - 1;
             assert_eq!(
                 words[last].to_u8() & 1,
                 0,
                 "{hrp}: a valid string pads with zero"
             );
-            words[last] = bech32::u5::try_from_u8(words[last].to_u8() | 1).expect("five bits");
-            let forged = bech32::encode(hrp, words, Variant::Bech32m).expect("encodes");
+            words[last] = Fe32::try_from(words[last].to_u8() | 1).expect("five bits");
+            let forged = encode_words::<Bech32m>(&prefix, words);
             assert!(!decodes(hrp, &forged), "{hrp}: padding");
         }
     }
@@ -849,17 +845,17 @@ mod tests {
 
     #[test]
     fn a_legacy_ck1_stays_readable_for_rotation() {
-        let secret = SecretKey::from_slice(&[0x11; 32]).expect("a valid key");
-        let signature = Secp256k1::signing_only().sign_ecdsa_recoverable(
-            &Message::from_digest(lightning_signed_digest(LEGACY_OWNERSHIP_MESSAGE)),
+        let secret = SecretKey::from_secret_bytes([0x11; 32]).expect("a valid key");
+        let signature = RecoverableSignature::sign_ecdsa_recoverable(
+            Message::from_digest(lightning_signed_digest(LEGACY_OWNERSHIP_MESSAGE)),
             &secret,
         );
         let (recovery, compact) = signature.serialize_compact();
         let mut payload = [0u8; 65];
         payload[..64].copy_from_slice(&compact);
-        payload[64] = recovery.to_i32() as u8;
+        payload[64] = u8::from(recovery);
         let ck1 = encode_bytes("ck", &payload);
-        let key = secret.x_only_public_key(&Secp256k1::new()).0.serialize();
+        let key = secret.x_only_public_key().0.to_byte_array();
 
         assert_eq!(decode_ck1(&ck1), Some(DecodedCk1::Legacy(payload)));
         assert!(is_ck1(&ck1));

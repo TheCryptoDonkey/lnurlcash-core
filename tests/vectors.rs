@@ -43,7 +43,8 @@ use lnurlcash_core::{
     MintFee,
 };
 use lnurlcash_core::{hash_k1, Error};
-use secp256k1::{Message, Parity, PublicKey, Secp256k1, SecretKey};
+use secp256k1::ecdsa::RecoverableSignature;
+use secp256k1::{Message, Parity, PublicKey, SecretKey};
 use serde_json::Value;
 
 fn vectors_dir() -> PathBuf {
@@ -910,20 +911,16 @@ fn bip39_seed(mnemonic: &str) -> Vec<u8> {
 }
 
 fn parity_of(private_key: &[u8; 32]) -> &'static str {
-    let key = SecretKey::from_slice(private_key).expect("a valid key");
-    match key.x_only_public_key(&Secp256k1::signing_only()).1 {
+    let key = SecretKey::from_secret_bytes(*private_key).expect("a valid key");
+    match key.x_only_public_key().1 {
         Parity::Even => "even",
         Parity::Odd => "odd",
     }
 }
 
 fn x_only_of(secret_key: &[u8; 32]) -> String {
-    let key = SecretKey::from_slice(secret_key).expect("a valid key");
-    hex::encode(
-        key.x_only_public_key(&Secp256k1::signing_only())
-            .0
-            .serialize(),
-    )
+    let key = SecretKey::from_secret_bytes(*secret_key).expect("a valid key");
+    hex::encode(key.x_only_public_key().0.to_byte_array())
 }
 
 /// One key-path note's spend fields, as part2.json and nostr-seed.json both
@@ -1156,10 +1153,10 @@ fn part2_certificate_vectors() {
     let vectors = load("part2.json");
     let mint = &vectors["mint"];
     let mint_pubkey = str_of(mint, "mintPubkey");
-    let mint_key = SecretKey::from_slice(&bytes32(mint, "privateKey")).expect("the mint's key");
-    let secp = Secp256k1::new();
+    let mint_key =
+        SecretKey::from_secret_bytes(bytes32(mint, "privateKey")).expect("the mint's key");
     assert_eq!(
-        hex::encode(PublicKey::from_secret_key(&secp, &mint_key).serialize()),
+        hex::encode(PublicKey::from_secret_key(&mint_key).serialize()),
         mint_pubkey,
         "the mint's key pair"
     );
@@ -1235,11 +1232,13 @@ fn part2_certificate_vectors() {
             .expect("hex")
             .try_into()
             .expect("32 bytes");
-        let (recovery, compact) = secp
-            .sign_ecdsa_recoverable(&Message::from_digest(digest_bytes), &mint_key)
-            .serialize_compact();
+        let (recovery, compact) = RecoverableSignature::sign_ecdsa_recoverable(
+            Message::from_digest(digest_bytes),
+            &mint_key,
+        )
+        .serialize_compact();
         assert_eq!(&signature[..64], &compact[..], "{at}");
-        assert_eq!(i32::from(signature[64]), recovery.to_i32(), "{at}");
+        assert_eq!(signature[64], u8::from(recovery), "{at}");
 
         // Each recovers to the mint's key: by the note's id, in either
         // spelling of the signature, by its cp1, and from the ck1 at its
@@ -1635,17 +1634,17 @@ fn spec_vectors() {
 
     // vector 4: cs1 mint offline certificate, over pk_0/pk_1 from vector 1
     let v4 = &vectors["vector4"];
-    let mint_key = SecretKey::from_slice(&bytes32(v4, "mintPrivateKey")).expect("valid mint key");
-    let secp = Secp256k1::new();
-    let mint_pubkey = hex::encode(PublicKey::from_secret_key(&secp, &mint_key).serialize());
+    let mint_key =
+        SecretKey::from_secret_bytes(bytes32(v4, "mintPrivateKey")).expect("valid mint key");
+    let mint_pubkey = hex::encode(PublicKey::from_secret_key(&mint_key).serialize());
     assert_eq!(mint_pubkey, str_of(v4, "mintPubkey"));
     let sign_certificate = |digest: [u8; 32]| -> String {
-        let (recovery, compact) = secp
-            .sign_ecdsa_recoverable(&Message::from_digest(digest), &mint_key)
-            .serialize_compact();
+        let (recovery, compact) =
+            RecoverableSignature::sign_ecdsa_recoverable(Message::from_digest(digest), &mint_key)
+                .serialize_compact();
         let mut signature = [0u8; 65];
         signature[..64].copy_from_slice(&compact);
-        signature[64] = recovery.to_i32() as u8;
+        signature[64] = u8::from(recovery);
         hex::encode(signature)
     };
 

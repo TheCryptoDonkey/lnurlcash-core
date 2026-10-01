@@ -2,6 +2,8 @@
 
 use url::Url;
 
+use crate::long_bech32;
+
 /// these hosts (plus .onion) resolve to http:// rather than https://
 const INSECURE_HOSTS: [&str; 3] = ["127.0.0.1", "0.0.0.0", "localhost"];
 
@@ -14,23 +16,16 @@ pub fn is_bech32_lnurl(data: &str) -> bool {
 }
 
 pub fn to_bech32_lnurl(url: &str) -> Option<String> {
-    use bech32::{ToBase32, Variant};
-    bech32::encode("lnurl", url.as_bytes().to_base32(), Variant::Bech32)
-        .ok()
+    long_bech32::encode::<long_bech32::Bech32>("lnurl", url.as_bytes())
         .map(|s| s.to_ascii_uppercase())
 }
 
 pub fn from_bech32_lnurl(data: &str) -> Option<String> {
-    use bech32::FromBase32;
     let trimmed = data.trim();
     if !trimmed.to_ascii_uppercase().starts_with("LNURL1") {
         return None;
     }
-    let (hrp, words, _variant) = bech32::decode(&trimmed.to_ascii_lowercase()).ok()?;
-    if hrp != "lnurl" {
-        return None;
-    }
-    let bytes = Vec::<u8>::from_base32(&words).ok()?;
+    let bytes = long_bech32::decode::<long_bech32::Bech32>("lnurl", &trimmed.to_ascii_lowercase())?;
     String::from_utf8(bytes).ok()
 }
 

@@ -61,6 +61,7 @@ pub mod ffi;
 #[cfg(feature = "ffi")]
 uniffi::setup_scaffolding!();
 pub mod fees;
+mod long_bech32;
 pub mod note;
 pub mod protocol;
 pub mod recoverable;
