@@ -5,14 +5,19 @@ before the protected publish job can use a registry token.
 
 ## One-time setup
 
-1. Sign in to crates.io with the GitHub account that will initially own the
-   crate and create a narrowly scoped API token.
-2. In this repository, create a `crates-io` GitHub environment. Restrict its
-   deployment branches and tags to `v*.*.*`, then add the token as the
-   environment secret `CARGO_REGISTRY_TOKEN`.
-3. After the first publish, add the other maintainers or an appropriate GitHub
-   team as crate owners. Do not put a personal registry token in repository
-   secrets or a local release script.
+The publish job uses crates.io trusted publishing: GitHub vouches for the
+workflow over OIDC and crates.io hands back a token that lives for one run. No
+registry secret is stored anywhere.
+
+1. On crates.io, open the `lnurlcash-core` crate's Settings, Trusted
+   Publishing, and add a GitHub publisher: owner `lnurlcash`, repository
+   `lnurlcash-core`, workflow `release.yml`, environment `crates-io`.
+2. In this repository, keep the `crates-io` GitHub environment restricted to
+   `v*.*.*` tags, with required reviewers if every publish should be approved.
+3. Add the other maintainers or an appropriate GitHub team as crate owners. Do
+   not put a personal registry token in repository secrets or a local release
+   script. (A `CARGO_REGISTRY_TOKEN` environment secret still works, and takes
+   precedence, but should only bridge until trusted publishing is set up.)
 
 ## Rehearsal
 

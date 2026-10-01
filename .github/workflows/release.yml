@@ -96,6 +96,11 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     environment: crates-io
+    permissions:
+      contents: read
+      id-token: write # crates.io trusted publishing (OIDC)
+    env:
+      HAS_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
     steps:
       - name: Checkout validated release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -120,8 +125,26 @@ jobs:
           sed -i "/^name = \"lnurlcash-core\"$/{n;s/^version = .*/version = \"$version\"/}" Cargo.lock
           test "$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')" = "$version"
 
+      - name: Skip a version crates.io already has (a re-run)
+        id: published
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if curl -sf -A "lnurlcash/lnurlcash-core release" "https://crates.io/api/v1/crates/lnurlcash-core/$version" > /dev/null; then
+            echo "lnurlcash-core $version is already on crates.io"
+            echo "done=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A short-lived token from crates.io's trusted publishing, unless the
+      # environment still holds a long-lived CARGO_REGISTRY_TOKEN.
+      - name: Authenticate to crates.io
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+        if: steps.published.outputs.done != 'true' && env.HAS_REGISTRY_TOKEN != 'true'
+
       - name: Publish to crates.io
+        if: steps.published.outputs.done != 'true'
         # --allow-dirty: the version stamp is the only change to the checkout
         run: cargo publish --locked --allow-dirty
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN || steps.auth.outputs.token }}
